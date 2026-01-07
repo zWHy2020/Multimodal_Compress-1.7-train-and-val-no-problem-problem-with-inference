@@ -1,0 +1,991 @@
+"""
+多模态JSCC推理脚本
+
+用于对单个文件（图像、文本、视频）进行推理和演示。
+支持 patch-based 推理处理任意尺寸的输入。
+"""
+
+import os
+import sys
+import torch
+import argparse
+import logging
+from pathlib import Path
+from typing import Optional, Dict, Any, List,Tuple
+from PIL import Image
+import numpy as np
+import math
+
+# 导入模型和工具
+from multimodal_jscc import MultimodalJSCC
+from config import EvaluationConfig
+from utils import (
+    seed_torch, logger_configuration, makedirs,
+    split_image_v2, merge_image_v2, split_video_v2, merge_video_v2
+)
+from torchvision import transforms
+from utils_check import print_model_structure_info, check_state_dict_compatibility
+import cv2
+import torch.nn.functional as F
+
+def pad_image(image: torch.Tensor, patch_size: int) -> Tuple[torch.Tensor, int, int]:
+    if image.dim() == 4:
+        _, _, H, W = image.shape
+    else:
+        _, H, W = image.shape
+    #_, _, H, W = image.shape
+    pad_h = (patch_size - (H % patch_size)) % patch_size
+    pad_w = (patch_size - (W % patch_size)) % patch_size
+    padded_image = F.pad(image, (0, pad_w, 0, pad_h), mode='replicate')
+    return padded_image, pad_h, pad_w
+def crop_image(image: torch.Tensor, pad_h: int, pad_w: int) -> torch.Tensor:
+    _, _, H, W = image.shape
+    return image[:, :, :H - pad_h, :W - pad_w]
+
+def load_image(image_path: str) -> torch.Tensor:
+    """
+    加载图像并转换为tensor
+    
+    Args:
+        image_path: 图像文件路径
+    
+    Returns:
+        torch.Tensor: [C, H, W]，ImageNet归一化的图像
+    """
+    image = Image.open(image_path).convert('RGB')
+    
+    # ImageNet归一化
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    
+    image_tensor = transform(image)
+    return image_tensor
+
+
+def load_text(text_path: str) -> str:
+    """
+    加载文本文件
+    
+    Args:
+        text_path: 文本文件路径
+    
+    Returns:
+        str: 文本内容
+    """
+    with open(text_path, 'r', encoding='utf-8') as f:
+        return f.read().strip()
+
+
+def load_video(video_path: str, max_frames: int = 10) -> torch.Tensor:
+    """
+    加载视频并转换为tensor
+    
+    Args:
+        video_path: 视频文件路径
+        max_frames: 最大帧数
+    
+    Returns:
+        torch.Tensor: [T, C, H, W]，ImageNet归一化的视频帧
+    """
+    cap = cv2.VideoCapture(video_path)
+    frames = []
+    
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frame_pil = Image.fromarray(frame_rgb)
+        frames.append(frame_pil)
+    
+    cap.release()
+    
+    # 限制帧数
+    if len(frames) > max_frames:
+        indices = np.linspace(0, len(frames) - 1, max_frames, dtype=int)
+        frames = [frames[i] for i in indices]
+    
+    # ImageNet归一化
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    
+    video_tensor = torch.stack([transform(frame) for frame in frames])
+    return video_tensor
+
+
+def denormalize_image(image_tensor: torch.Tensor) -> np.ndarray:
+    """
+    将ImageNet归一化的图像tensor转换回可显示的图像
+    
+    Args:
+        image_tensor: [C, H, W] 或 [B, C, H, W]
+    
+    Returns:
+        np.ndarray: [H, W, C]，uint8格式
+    """
+    if image_tensor.dim() == 4:
+        image_tensor = image_tensor[0]  # [B, C, H, W] -> [C, H, W]
+    mean = torch.tensor([0.485, 0.456, 0.406], device=image_tensor.device).view(3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225], device=image_tensor.device).view(3, 1, 1)
+    image_tensor = image_tensor * std + mean
+    
+    image_tensor = torch.clamp(image_tensor, 0, 1)
+    image_np = (image_tensor.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+    return image_np
+ 
+    #image_tensor = torch.clamp(image_tensor, 0, 1)
+    
+    #image_np = (image_tensor.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+    #return image_np
+
+
+def infer_image(
+    model: MultimodalJSCC,
+    image_path: str,
+    config: EvaluationConfig,
+    device: torch.device,
+    logger: logging.Logger,
+    text_input: Optional[str] = None,
+    text_attention_mask: Optional[torch.Tensor] = None,
+    multiple_text_inputs: Optional[List[str]] = None
+) -> Dict[str, Any]:
+    """
+    对单张图像进行推理
+    
+    Args:
+        model: 训练好的模型
+        image_path: 图像路径
+        config: 评估配置
+        device: 计算设备
+        logger: 日志记录器
+    
+    Returns:
+        Dict[str, Any]: 推理结果
+    """
+    logger.info(f"加载图像: {image_path}")
+    image = load_image(image_path)  # [C, H, W]
+    original_shape = image.shape[1:]
+    
+    logger.info(f"图像尺寸: {original_shape[0]}x{original_shape[1]}")
+    
+    # 【优化】支持多条语义上下文（不增加显存和计算）
+    semantic_context = None
+    multiple_semantic_contexts = None
+    
+    # 收集所有需要编码的文本输入
+    texts_to_encode = []
+    if text_input is not None:
+        texts_to_encode.append(text_input)
+    if multiple_text_inputs is not None and len(multiple_text_inputs) > 0:
+        texts_to_encode.extend(multiple_text_inputs)
+    
+    if len(texts_to_encode) > 0:
+        # 编码所有文本输入
+        semantic_contexts_list = []
+        for idx, text in enumerate(texts_to_encode):
+            # 简单文本编码（应与训练时一致）
+            #text_tensor = torch.tensor([ord(c) for c in text[:config.max_text_length]], dtype=torch.long)
+            vocab_limit = config.vocab_size - 1
+            text_tensor = torch.tensor([min(ord(c), vocab_limit) for c in text[:config.max_text_length]], dtype=torch.long)
+            if len(text_tensor) < config.max_text_length:
+                pad_len = config.max_text_length - len(text_tensor)
+                text_tensor = torch.cat([text_tensor, torch.zeros(pad_len, dtype=torch.long)])
+            text_tensor = text_tensor.unsqueeze(0).to(device)  # [1, seq_len]
+            
+            # 处理attention mask
+            mask = torch.ones_like(text_tensor)
+            if idx == 0 and text_attention_mask is not None:
+                # 只对第一个文本使用提供的attention mask
+                if text_attention_mask.dim() == 1:
+                    mask = text_attention_mask.unsqueeze(0).to(device)
+                else:
+                    mask = text_attention_mask.to(device)
+            
+            # 编码文本以获取语义上下文
+            text_encoded_results = model.encode(
+                text_input=text_tensor,
+                text_attention_mask=mask
+            )
+            if 'text_encoded' in text_encoded_results:
+                semantic_contexts_list.append(text_encoded_results['text_encoded'])
+                # 及时释放中间变量
+                del text_tensor, mask, text_encoded_results
+        
+        # 分配语义上下文：第一条作为主语义，其余作为多条语义
+        if len(semantic_contexts_list) > 0:
+            semantic_context = semantic_contexts_list[0]
+            logger.debug(f"获取主语义上下文: shape={semantic_context.shape}")
+            
+            if len(semantic_contexts_list) > 1:
+                multiple_semantic_contexts = semantic_contexts_list[1:]
+                logger.info(f"使用多条语义上下文: {len(multiple_semantic_contexts)} 条")
+                # 清理列表引用，但保留tensor（它们会被传递给解码器）
+                del semantic_contexts_list
+    
+    model.eval()
+    with torch.no_grad():
+        # 检查是否需要patch推理
+        expected_h, expected_w = (224, 224)  # 默认值
+        if hasattr(model, 'image_encoder') and hasattr(model.image_encoder, 'patch_embed'):
+            if hasattr(model.image_encoder.patch_embed, 'img_size'):
+                expected_h, expected_w = model.image_encoder.patch_embed.img_size
+        
+        need_patch = (original_shape[0] != expected_h or original_shape[1] != expected_w)
+        
+        if need_patch and config.use_patch_inference:
+            pad_multiple = expected_h
+            padded_image, pad_h, pad_w = pad_image(image, pad_multiple)
+            logger.info(f"使用 patch-based 推理（patch_size={config.patch_size}, overlap={config.patch_overlap}）")
+            
+            # 分割图像
+            #patches, meta = split_image_v2(image, config.patch_size, config.patch_overlap)
+            #patches, meta = split_image_v2(image, expected_h, config.patch_overlap)
+            patches, meta = split_image_v2(padded_image, expected_h, config.patch_overlap) # <--- 替换为这行
+            logger.info(f"使用 patch-based 推理（patch_size={expected_h}, overlap={config.patch_overlap}）")
+            patches = patches.to(device)
+            global_input = transforms.functional.resize(image, (expected_h, expected_w))
+            global_input = global_input.unsqueeze(0).to(device)
+            
+            logger.info(f"图像分割为 {len(patches)} 个 patches")
+            with torch.no_grad():
+                global_encoded_results = model.encode(image_input=global_input)
+                global_guide_vector = global_encoded_results['image_guide']
+                global_features = global_encoded_results['image_encoded']
+                global_power = torch.mean(global_features ** 2).item()
+                logger.info(f"全局功率统计量: {global_power:.6f}")
+
+                logger.info("已计算全局语义引导向量，将应用于所有 Patch")
+                del global_encoded_results, global_input, global_features
+            original_norm_flag = model.channel.channel_model.power_normalization
+            model.channel.channel_model.power_normalization = False
+            # 【修复】使用分阶段处理：编码 -> 信道 -> 解码（传入语义上下文）
+            # 批量处理patches（使用较小的batch size以避免OOM）
+            patch_results_list = []
+            patch_batch_size = 4  # 减小batch size以减少内存占用
+            
+            for i in range(0, len(patches), patch_batch_size):
+                patch_batch = patches[i:i+patch_batch_size]
+                current_batch_size = patch_batch.size(0)
+                
+                # 阶段1：编码
+                patch_encoded = model.encode(image_input=patch_batch, snr_db=config.snr_db)
+                patch_encoded_features = patch_encoded['image_encoded']
+                #patch_guide_vectors = patch_encoded['image_guide']
+                #patch_guide_vectors = global_guide_vector.expand(current_batch_size, -1)
+                
+                # 阶段2：功率归一化
+                #if 'image' in model.power_normalizer:
+                    #patch_encoded_features = model.power_normalizer['image'](patch_encoded_features)
+                patch_normalized = patch_encoded_features / (math.sqrt(global_power + 1e-6))
+                patch_guide_vectors = global_guide_vector.expand(current_batch_size, -1)
+
+                # 阶段3：信道传输
+                patch_transmitted = model.channel(patch_normalized)
+                
+                # 阶段4：解码（传入语义上下文以启用语义引导）
+                # 【优化】直接调用image_decoder以支持多条语义上下文
+                #patch_decoded_image = model.image_decoder(
+                    #patch_transmitted,
+                    #patch_guide_vectors,
+                    #semantic_context=semantic_context,
+                    #multiple_semantic_contexts=multiple_semantic_contexts,
+                    #snr_db=config.snr_db
+                #)
+                transmitted_dict = {'image': patch_transmitted}
+                guide_dict = {'image': patch_guide_vectors}
+                decoded_results = model.decode(
+                    transmitted_features=transmitted_dict,
+                    guide_vectors=guide_dict,
+                    semantic_context=semantic_context,
+                    multiple_semantic_contexts=multiple_semantic_contexts,
+                    snr_db=config.snr_db
+                )
+                patch_decoded_image = decoded_results['image_decoded']
+                # 立即移动到CPU以释放GPU内存
+                patch_results_list.append(patch_decoded_image.cpu())
+                
+                # 清理中间变量
+                del patch_encoded, patch_encoded_features, patch_guide_vectors
+                del patch_transmitted, patch_decoded_image, patch_batch
+                # 每处理几个batch后清理GPU缓存
+                if (i // patch_batch_size + 1) % 5 == 0:
+                    torch.cuda.empty_cache()
+            #model.channel.channel_model.power_normalization = original_norm_flag
+            # 合并patches（数据已在CPU上）
+            all_patches = torch.cat(patch_results_list, dim=0)
+            reconstructed_image = merge_image_v2(all_patches, meta)
+            # 清理patch列表以释放内存
+            del patch_results_list, all_patches, patches
+            torch.cuda.empty_cache()
+            reconstructed_image = crop_image(reconstructed_image, pad_h, pad_w)
+            model.channel.channel_model.power_normalization = original_norm_flag
+            
+        else:
+            logger.info("使用标准推理")
+            # 如果尺寸不匹配，需要resize（但这不是理想情况）
+            #if original_shape[0] != expected_h or original_shape[1] != expected_w:
+                #logger.warning(f"图像尺寸不匹配，将resize到 {expected_h}x{expected_w}")
+                #image = transforms.functional.resize(image, (expected_h, expected_w))
+            pad_multiple = 64
+            padded_image, pad_h, pad_w = pad_image(image, pad_multiple)
+            image = padded_image
+            image = image.unsqueeze(0).to(device)  # [1, C, H, W]
+            # 【优化】对于标准推理，也需要支持多条语义
+            # 使用完整的前向传播，但需要手动处理语义上下文
+            #reconstructed_image = crop_image(reconstructed_image, pad_h, pad_w)
+            if semantic_context is not None or multiple_semantic_contexts is not None:
+                # 分阶段处理以支持多条语义
+                encoded = model.encode(image_input=image, snr_db=config.snr_db)
+                image_encoded = encoded['image_encoded']
+                image_guide = encoded['image_guide']
+            
+                # 功率归一化
+                if 'image' in model.power_normalizer:
+                    image_encoded = model.power_normalizer['image'](image_encoded)
+                
+                # 信道传输
+                transmitted = model.channel(image_encoded)
+                
+                # 解码（支持多条语义）
+                reconstructed_image = model.image_decoder(
+                    transmitted,
+                    image_guide,
+                    semantic_context=semantic_context,
+                    multiple_semantic_contexts=multiple_semantic_contexts,
+                    snr_db=config.snr_db
+                )
+            else:
+                results = model(image_input=image, snr_db=config.snr_db)
+                reconstructed_image = results['image_decoded']
+            reconstructed_image = crop_image(reconstructed_image, pad_h, pad_w)
+    return {
+        'original': image.cpu(),
+        'reconstructed': reconstructed_image.cpu(),
+        'shape': original_shape
+    }
+
+
+def infer_text(
+    model: MultimodalJSCC,
+    text_path: str,
+    config: EvaluationConfig,
+    device: torch.device,
+    logger: logging.Logger
+) -> Dict[str, Any]:
+    """
+    对文本进行推理
+    
+    Args:
+        model: 训练好的模型
+        text_path: 文本路径
+        config: 评估配置
+        device: 计算设备
+        logger: 日志记录器
+    
+    Returns:
+        Dict[str, Any]: 推理结果
+    """
+    logger.info(f"加载文本: {text_path}")
+    text = load_text(text_path)
+    logger.info(f"文本长度: {len(text)} 字符")
+    
+    # 简单文本编码（实际应该使用与训练时相同的tokenizer）
+    # 这里使用简单的字符编码作为示例
+    #text_tensor = torch.tensor([ord(c) for c in text[:config.max_text_length]], dtype=torch.long)
+    vocab_limit = config.vocab_size - 1
+    text_tensor = torch.tensor([min(ord(c), vocab_limit) for c in text[:config.max_text_length]], dtype=torch.long)
+    if len(text_tensor) < config.max_text_length:
+        # 填充到固定长度
+        pad_len = config.max_text_length - len(text_tensor)
+        text_tensor = torch.cat([text_tensor, torch.zeros(pad_len, dtype=torch.long)])
+    
+    text_tensor = text_tensor.unsqueeze(0).to(device)  # [1, seq_len]
+    attention_mask = torch.ones_like(text_tensor)
+    
+    model.eval()
+    with torch.no_grad():
+        results = model(
+            text_input=text_tensor,
+            text_attention_mask=attention_mask,
+            snr_db=config.snr_db
+        )
+    
+    return {
+        'original': text,
+        'reconstructed': results['text_decoded'].cpu(),
+        'text_tensor': text_tensor.cpu()
+    }
+
+
+def infer_video(
+    model: MultimodalJSCC,
+    video_path: str,
+    config: EvaluationConfig,
+    device: torch.device,
+    logger: logging.Logger,
+    text_input: Optional[str] = None,
+    text_attention_mask: Optional[torch.Tensor] = None,
+    multiple_text_inputs: Optional[List[str]] = None
+) -> Dict[str, Any]:
+    """
+    对视频进行推理
+    
+    Args:
+        model: 训练好的模型
+        video_path: 视频路径
+        config: 评估配置
+        device: 计算设备
+        logger: 日志记录器
+    
+    Returns:
+        Dict[str, Any]: 推理结果
+    """
+    logger.info(f"加载视频: {video_path}")
+    video = load_video(video_path, max_frames=config.max_video_frames)  # [T, C, H, W]
+    original_shape = video.shape
+    
+    logger.info(f"视频尺寸: {original_shape[0]}帧, {original_shape[2]}x{original_shape[3]}")
+    
+    # 【优化】支持多条语义上下文（与infer_image保持一致）
+    semantic_context = None
+    multiple_semantic_contexts = None
+    
+    # 收集所有需要编码的文本输入
+    texts_to_encode = []
+    if text_input is not None:
+        texts_to_encode.append(text_input)
+    if multiple_text_inputs is not None and len(multiple_text_inputs) > 0:
+        texts_to_encode.extend(multiple_text_inputs)
+    
+    if len(texts_to_encode) > 0:
+        # 编码所有文本输入
+        semantic_contexts_list = []
+        for idx, text in enumerate(texts_to_encode):
+            # 简单文本编码（应与训练时一致）
+            #text_tensor = torch.tensor([ord(c) for c in text[:config.max_text_length]], dtype=torch.long)
+            vocab_limit = config.vocab_size - 1
+            text_tensor = torch.tensor([min(ord(c), vocab_limit) for c in text[:config.max_text_length]], dtype=torch.long)
+            if len(text_tensor) < config.max_text_length:
+                pad_len = config.max_text_length - len(text_tensor)
+                text_tensor = torch.cat([text_tensor, torch.zeros(pad_len, dtype=torch.long)])
+            text_tensor = text_tensor.unsqueeze(0).to(device)  # [1, seq_len]
+            
+            # 处理attention mask
+            mask = torch.ones_like(text_tensor)
+            if idx == 0 and text_attention_mask is not None:
+                if text_attention_mask.dim() == 1:
+                    mask = text_attention_mask.unsqueeze(0).to(device)
+                else:
+                    mask = text_attention_mask.to(device)
+            
+            # 编码文本以获取语义上下文
+            text_encoded_results = model.encode(
+                text_input=text_tensor,
+                text_attention_mask=mask
+            )
+            if 'text_encoded' in text_encoded_results:
+                semantic_contexts_list.append(text_encoded_results['text_encoded'])
+                del text_tensor, mask, text_encoded_results
+        
+        # 分配语义上下文
+        if len(semantic_contexts_list) > 0:
+            semantic_context = semantic_contexts_list[0]
+            logger.debug(f"获取主语义上下文: shape={semantic_context.shape}")
+            
+            if len(semantic_contexts_list) > 1:
+                multiple_semantic_contexts = semantic_contexts_list[1:]
+                logger.info(f"使用多条语义上下文: {len(multiple_semantic_contexts)} 条")
+                del semantic_contexts_list
+    
+    model.eval()
+    with torch.no_grad():
+        # 检查是否需要patch推理
+        expected_h, expected_w = (224, 224)  # 默认值
+        if hasattr(model, 'image_encoder') and hasattr(model.image_encoder, 'patch_embed'):
+            if hasattr(model.image_encoder.patch_embed, 'img_size'):
+                expected_h, expected_w = model.image_encoder.patch_embed.img_size
+            # 尝试获取期望的帧尺寸
+            pass  # 视频编码器可能没有固定的图像尺寸要求
+        pad_multiple = expected_h # 或者 64
+        padded_video, pad_h, pad_w = pad_image(video, pad_multiple)
+        need_patch = (original_shape[2] != expected_h or original_shape[3] != expected_w)
+        need_patch = (original_shape[2] != expected_h or original_shape[3] != expected_w)
+        if need_patch and config.use_patch_inference:
+            logger.info(f"使用 patch-based 推理...")
+            patches_list, meta_list = split_video_v2(padded_video, expected_h, config.patch_overlap)
+        #if need_patch and config.use_patch_inference:
+            #logger.info(f"使用 patch-based 推理（patch_size={config.patch_size}, overlap={config.patch_overlap}）")
+            
+            # 分割视频（逐帧处理）
+            #patches_list, meta_list = split_video_v2(video, config.patch_size, config.patch_overlap)
+            patches_list, meta_list = split_video_v2(video, expected_h, config.patch_overlap)
+            logger.info(f"使用 patch-based 推理（patch_size={expected_h}, overlap={config.patch_overlap}）")
+            # 收集所有帧的所有patches
+            all_patches = []
+            frame_start_indices = [0]
+            current_idx = 0
+            
+            for t, frame_patches in enumerate(patches_list):
+                all_patches.append(frame_patches)
+                current_idx += len(frame_patches)
+                frame_start_indices.append(current_idx)
+            
+            # 批量处理所有patches
+            all_patches_tensor = torch.cat(all_patches, dim=0).to(device)
+            logger.info(f"视频分割为 {len(all_patches_tensor)} 个 patches（来自 {original_shape[0]} 帧）")
+            
+            # 【修复】使用分阶段处理：编码 -> 信道 -> 解码（传入语义上下文）
+            patch_results_list = []
+            patch_batch_size = 4  # 减小batch size以减少内存占用
+            
+            for i in range(0, len(all_patches_tensor), patch_batch_size):
+                patch_batch = all_patches_tensor[i:i+patch_batch_size]
+                
+                # 阶段1：编码
+                patch_encoded = model.encode(image_input=patch_batch, snr_db=config.snr_db)
+                patch_encoded_features = patch_encoded['image_encoded']
+                patch_guide_vectors = patch_encoded['image_guide']
+                
+                # 阶段2：功率归一化
+                #if 'image' in model.power_normalizer:
+                    #patch_encoded_features = model.power_normalizer['image'](patch_encoded_features)
+                
+                # 阶段3：信道传输
+                patch_transmitted = model.channel(patch_encoded_features)
+                
+                # 阶段4：解码（传入语义上下文以启用语义引导）
+                # 【优化】直接调用image_decoder以支持多条语义上下文
+                #patch_decoded_image = model.image_decoder(
+                    #patch_transmitted,
+                    #patch_guide_vectors,
+                    #semantic_context=semantic_context,
+                    #multiple_semantic_contexts=multiple_semantic_contexts,
+                    #snr_db=config.snr_db
+                #)
+                transmitted_dict = {'image': patch_transmitted}
+                guide_dict = {'image': patch_guide_vectors}
+                decoded_results = model.decode(
+                    transmitted_features=transmitted_dict,
+                    guide_vectors=guide_dict,
+                    semantic_context=semantic_context,
+                    multiple_semantic_contexts=multiple_semantic_contexts,
+                    snr_db=config.snr_db
+                )
+                patch_decoded_image = decoded_results['image_decoded']
+                # 立即移动到CPU以释放GPU内存
+                patch_results_list.append(patch_decoded_image.cpu())
+                
+                # 清理中间变量
+                del patch_encoded, patch_encoded_features, patch_guide_vectors
+                del patch_transmitted, patch_decoded_image, patch_batch
+                # 每处理几个batch后清理GPU缓存
+                if (i // patch_batch_size + 1) % 5 == 0:
+                    torch.cuda.empty_cache()
+            
+            # 合并所有patch结果（数据已在CPU上）
+            all_reconstructed_patches = torch.cat(patch_results_list, dim=0)
+            
+            # 按帧重组patches
+            reconstructed_patches_by_frame = []
+            for t in range(original_shape[0]):
+                start_idx = frame_start_indices[t]
+                end_idx = frame_start_indices[t + 1]
+                frame_patches = all_reconstructed_patches[start_idx:end_idx]
+                reconstructed_patches_by_frame.append(frame_patches)
+            
+            # 清理中间变量
+            del patch_results_list, all_reconstructed_patches, all_patches_tensor
+            torch.cuda.empty_cache()
+            
+            # 逐帧合并，重建视频
+            reconstructed_video = merge_video_v2(reconstructed_patches_by_frame, meta_list)
+            reconstructed_video = crop_image(reconstructed_video, pad_h, pad_w)
+            
+
+        else:
+            logger.info("使用标准推理")
+            video_input = padded_video.unsqueeze(0).to(device)
+            results = model(video_input=video_input, snr_db=config.snr_db)
+            reconstructed_video = results['video_decoded']
+            if reconstructed_video.dim() == 5:
+                reconstructed_video = reconstructed_video.squeeze(0)
+            reconstructed_video = crop_image(reconstructed_video, pad_h, pad_w)
+    
+    return {
+        'original': video.cpu(),
+        'reconstructed': reconstructed_video.cpu(),
+        'shape': original_shape
+    }
+
+
+def save_result(result: Dict[str, Any], output_path: str, modality: str):
+    """
+    保存推理结果
+    
+    Args:
+        result: 推理结果字典
+        output_path: 输出路径（必须是完整的文件路径，对于图像和文本）
+        modality: 模态类型（'image', 'text', 'video'）
+    """
+    if modality == 'image':
+        # 保存图像
+        # 【修复】确保输出路径有有效的扩展名
+        if not os.path.splitext(output_path)[1]:
+            # 如果没有扩展名，添加默认的png扩展名
+            output_path = output_path + '.png'
+        
+        reconstructed_np = denormalize_image(result['reconstructed'])
+        Image.fromarray(reconstructed_np).save(output_path)
+    elif modality == 'text':
+        # 保存文本（这里只是简单示例，实际应该解码）
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write(f"原始文本:\n{result['original']}\n\n")
+            f.write(f"重建文本（tensor）:\n{result['reconstructed']}\n")
+    elif modality == 'video':
+        # 保存视频帧（作为图像序列）
+        os.makedirs(output_path, exist_ok=True)
+        reconstructed = result['reconstructed']
+        if reconstructed.dim() == 5:
+            reconstructed = reconstructed[0]  # [B, T, C, H, W] -> [T, C, H, W]
+        
+        T = reconstructed.shape[0]
+        for t in range(T):
+            frame = reconstructed[t]  # [C, H, W]
+            frame_np = denormalize_image(frame)
+            frame_path = os.path.join(output_path, f'frame_{t:04d}.png')
+            Image.fromarray(frame_np).save(frame_path)
+
+
+def load_model(model_path: str, config: EvaluationConfig, device: torch.device, logger: logging.Logger) -> MultimodalJSCC:
+    """
+    加载模型
+    
+    Args:
+        model_path: 模型权重路径
+        config: 评估配置
+        device: 计算设备
+        logger: 日志记录器
+    
+    Returns:
+        MultimodalJSCC: 加载的模型
+    """
+    #logger.info(f"加载模型: {model_path}")
+    print(f"正在加载模型权重: {model_path}")
+    # 加载检查点
+    checkpoint = torch.load(model_path, map_location=device)
+    if 'model_config' in checkpoint:
+        #model_config = checkpoint['model_config']
+        logger.info("✅ 发现 Checkpoint 中保存的模型配置，将直接使用它来初始化模型。")
+        model_config = checkpoint['model_config']
+        model_config['pretrained'] = False
+        model_config['freeze_encoder'] = False
+        if 'img_embed_dims' in model_config:
+            config.img_embed_dims = model_config['img_embed_dims']
+    else:
+        logger.warning("⚠️ Checkpoint 中未找到配置信息！将使用 EvaluationConfig 的默认值（极高风险！）")
+        model_config = {
+            'vocab_size': config.vocab_size,
+            'text_embed_dim': config.text_embed_dim,
+            'text_num_heads': config.text_num_heads,
+            'text_num_layers': config.text_num_layers,
+            'text_output_dim': config.text_output_dim,
+            'img_size': config.img_size,
+            'patch_size': getattr(config, 'img_patch_size', 4),
+            #'patch_size': config.img_patch_size,
+            'img_embed_dims': config.img_embed_dims,
+            'img_depths': config.img_depths,
+            'img_num_heads': config.img_num_heads,
+            'img_output_dim': config.img_output_dim,
+            'mlp_ratio': getattr(config, 'mlp_ratio', 4.0),
+            'video_hidden_dim': config.video_hidden_dim,
+            'video_num_frames': config.video_num_frames,
+            'video_use_optical_flow': config.video_use_optical_flow,
+            'video_use_convlstm': config.video_use_convlstm,
+            'video_output_dim': config.video_output_dim,
+            'channel_type': config.channel_type,
+            'snr_db': config.snr_db,
+            'pretrained': False, # 推理时强制关闭
+        }
+    try:
+         model = MultimodalJSCC(**model_config)
+    except TypeError as e:
+        logger.error(f"模型初始化失败，参数不匹配: {e}")
+        logger.error("这通常是因为训练时的代码版本与当前代码版本的参数列表不一致。")
+        raise e
+    m = model.image_encoder
+    print("layer1 downsample reduction:", m.layers[0].downsample.reduction.weight.shape if m.layers[0].downsample else None)
+    print("layer2 downsample reduction:", m.layers[1].downsample.reduction.weight.shape if m.layers[1].downsample else None)
+    print("layer3 downsample reduction:", m.layers[2].downsample.reduction.weight.shape if m.layers[2].downsample else None)
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+        state_dict = checkpoint['model_state_dict']
+    else:
+        state_dict = checkpoint
+    logger.info("=== 模型结构验证 ===")
+    print_model_structure_info(model, logger)
+    if not check_state_dict_compatibility(model, state_dict, logger):
+        raise RuntimeError("严重错误：尽管使用了保存的配置，权重维度依然不匹配！请检查代码是否被修改过。")
+    model.load_state_dict(state_dict, strict=True) # 建议改为 True，有问题直接报出来
+    model = model.to(device)
+    model.eval()
+    logger.info("模型加载成功！")
+    return model
+        
+
+        #config.img_embed_dims = saved_config.get('img_embed_dims', config.img_embed_dims)
+        #config.img_depths = saved_config.get('img_depths', config.img_depths)
+        #config.img_num_heads = saved_config.get('img_num_heads', config.img_num_heads)
+        #config.pretrained = saved_config.get('pretrained', False) # 恢复预训练开关
+        #print(f"配置已更新: Pretrained={config.pretrained}, Dims={config.img_embed_dims}")
+    #else:
+        #print("警告: Checkpoint 中未找到配置信息，将使用 config.py 的默认值（可能导致维度不匹配！）")
+    
+    
+    # 尝试从检查点中恢复模型配置
+   # model_kwargs = {
+        #'vocab_size': config.vocab_size,
+        #'text_embed_dim': config.text_embed_dim,
+        #'text_num_heads': config.text_num_heads,
+        #'text_num_layers': config.text_num_layers,
+        #'text_output_dim': config.text_output_dim,
+        #'img_size': config.img_size,
+        #'patch_size': config.img_patch_size,
+        #'img_embed_dims': config.img_embed_dims,
+        #'img_depths': config.img_depths,
+        #'img_num_heads': config.img_num_heads,
+        #'img_output_dim': config.img_output_dim,
+        #'mlp_ratio': getattr(config, 'mlp_ratio', 4.0),
+        #'video_hidden_dim': config.video_hidden_dim,
+        #'video_num_frames': config.video_num_frames,
+        #'video_use_optical_flow': config.video_use_optical_flow,
+        #'video_use_convlstm': config.video_use_convlstm,
+        #'video_output_dim': config.video_output_dim,
+        #'channel_type': config.channel_type,
+        #'snr_db': config.snr_db,
+        #'pretrained': config.pretrained,
+        #'pretrained_model_name': 'swin_tiny_patch4_window7_224'
+    #}
+    
+    # 如果检查点中包含模型配置，使用检查点的配置
+    #if isinstance(checkpoint, dict) and 'model_config' in checkpoint:
+        #logger.info("发现 Checkpoint 中保存的模型配置，正在覆盖默认配置...")
+        #saved_config = checkpoint['model_config']
+       # keys_to_overwrite = ['img_embed_dims', 'img_depths', 'img_num_heads', 'patch_size', 'img_size']
+        #for k in keys_to_overwrite:
+            #if k in saved_config:
+                #model_kwargs[k] = saved_config[k]
+                #logger.info(f"  - 覆盖 {k}: {saved_config[k]}")
+        #model_kwargs.update(saved_config)
+   
+    
+    # 创建模型
+    #model = MultimodalJSCC(**model_kwargs)
+    #logger.info("=== 推理模型结构验证 ===")
+    #print_model_structure_info(model, logger)
+    #if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+        #tate_dict = checkpoint['model_state_dict']
+    #else:
+        #state_dict = checkpoint
+    # 加载权重
+    #if isinstance(checkpoint, dict):
+        #if 'model_state_dict' in checkpoint:
+            #model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+            #logger.info("加载模型权重（从model_state_dict）")
+        #else:
+            #model.load_state_dict(checkpoint, strict=False)
+            #logger.info("加载模型权重（直接state_dict）")
+    #else:
+        #model.load_state_dict(checkpoint, strict=False)
+        #logger.info("加载模型权重（检查点本身）")
+    #if not check_state_dict_compatibility(model, state_dict, logger):
+        #raise RuntimeError("模型配置与权重文件维度不匹配！请检查 inference.py 中的默认配置或 checkpoint 的来源。")
+    #model.load_state_dict(state_dict, strict=False)
+    #model = model.to(device)
+    #model.eval()
+    
+    #logger.info("模型加载成功")
+    
+    #return model
+
+
+def main():
+    parser = argparse.ArgumentParser(description='多模态JSCC推理脚本')
+    parser.add_argument('--model-path', type=str, required=True, help='模型权重路径')
+    parser.add_argument('--input', type=str, required=True, help='输入文件路径（图像、文本或视频）')
+    parser.add_argument('--output', type=str, default=None, help='输出路径（默认：输入文件名_reconstructed）')
+    parser.add_argument('--modality', type=str, choices=['image', 'text', 'video'], 
+                       default=None, help='模态类型（如果不指定，将从文件扩展名推断）')
+    parser.add_argument('--snr', type=float, default=10.0, help='信噪比 (dB)')
+    parser.add_argument('--no-patch', action='store_true', help='禁用patch-based推理')
+    parser.add_argument('--text-input', type=str, default=None, 
+                       help='文本输入路径（用于语义引导图像/视频解码）')
+    parser.add_argument('--prompt', type=str, default=None,
+                       help='文本提示（直接输入文本，用于语义引导图像/视频解码）')
+    parser.add_argument('--prompts', type=str, nargs='+', default=None,
+                       help='多条文本提示（用于多条语义引导，与--prompt互斥）')
+    args = parser.parse_args()
+    
+    # 设置随机种子
+    seed_torch(42)
+    
+    # 创建配置
+    config = EvaluationConfig()
+    config.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    config.model_path = args.model_path
+    config.snr_db = args.snr
+    config.use_patch_inference = not args.no_patch
+    
+    # 推断模态类型
+    if args.modality is None:
+        ext = os.path.splitext(args.input)[1].lower()
+        if ext in ['.jpg', '.jpeg', '.png', '.bmp']:
+            modality = 'image'
+        elif ext in ['.txt', '.text']:
+            modality = 'text'
+        elif ext in ['.mp4', '.avi', '.mov', '.mkv']:
+            modality = 'video'
+        else:
+            raise ValueError(f"无法从文件扩展名推断模态类型: {ext}，请使用 --modality 参数指定")
+    else:
+        modality = args.modality
+    
+    # 设置输出路径
+    if args.output is None:
+        base_name = os.path.splitext(os.path.basename(args.input))[0]
+        if modality == 'image':
+            args.output = f'{base_name}_reconstructed.png'
+        elif modality == 'text':
+            args.output = f'{base_name}_reconstructed.txt'
+        elif modality == 'video':
+            args.output = f'{base_name}_reconstructed_frames'
+    else:
+        # 【修复】处理用户提供的输出路径
+        # 检查输出路径是否是目录或没有扩展名
+        output_ext = os.path.splitext(args.output)[1]
+        is_directory = os.path.isdir(args.output) or (not output_ext and not os.path.exists(args.output))
+        
+        if is_directory:
+            # 输出路径是目录，需要从输入路径提取文件名并添加扩展名
+            base_name = os.path.splitext(os.path.basename(args.input))[0]
+            input_ext = os.path.splitext(args.input)[1].lower()
+            
+            if modality == 'image':
+                # 如果输入有图像扩展名，使用相同的扩展名；否则使用png
+                if input_ext in ['.jpg', '.jpeg', '.png', '.bmp']:
+                    file_ext = input_ext if input_ext != '.jpeg' else '.jpg'
+                else:
+                    file_ext = '.png'
+                args.output = os.path.join(args.output, f'{base_name}_reconstructed{file_ext}')
+            elif modality == 'text':
+                args.output = os.path.join(args.output, f'{base_name}_reconstructed.txt')
+            elif modality == 'video':
+                # 视频输出是目录
+                args.output = os.path.join(args.output, f'{base_name}_reconstructed_frames')
+        elif not output_ext:
+            # 输出路径是文件路径但没有扩展名，需要添加扩展名
+            input_ext = os.path.splitext(args.input)[1].lower()
+            
+            if modality == 'image':
+                # 如果输入有图像扩展名，使用相同的扩展名；否则使用png
+                if input_ext in ['.jpg', '.jpeg', '.png', '.bmp']:
+                    file_ext = input_ext if input_ext != '.jpeg' else '.jpg'
+                else:
+                    file_ext = '.png'
+                args.output = args.output + file_ext
+            elif modality == 'text':
+                args.output = args.output + '.txt'
+            # video模式不需要扩展名，因为它输出的是目录
+    
+    # 创建输出目录
+    if modality == 'video':
+        makedirs(args.output)
+    else:
+        # 对于图像和文本，确保输出目录存在
+        output_dir = os.path.dirname(args.output)
+        if output_dir:
+            makedirs(output_dir)
+    
+    # 配置日志
+    log_config = type('LogConfig', (), {
+        'workdir': './logs',
+        'log': os.path.join('./logs', 'inference.log'),
+        'samples': args.output if modality != 'video' else os.path.dirname(args.output),
+        'models': os.path.dirname(args.model_path)
+    })()
+    logger = logger_configuration(log_config, save_log=True)
+    
+    logger.info("=" * 80)
+    logger.info("多模态JSCC推理脚本")
+    logger.info("=" * 80)
+    logger.info(f"模型路径: {config.model_path}")
+    logger.info(f"输入文件: {args.input}")
+    logger.info(f"输出路径: {args.output}")
+    logger.info(f"模态类型: {modality}")
+    logger.info(f"SNR: {config.snr_db} dB")
+    logger.info(f"设备: {config.device}")
+    logger.info(f"Patch推理: {'启用' if config.use_patch_inference else '禁用'}")
+    
+    # 加载模型
+    model = load_model(config.model_path, config, config.device, logger)
+    
+    # 加载文本输入（如果提供，用于语义引导）
+    text_input = None
+    text_attention_mask = None
+    multiple_text_inputs = None
+    
+    # 【优化】支持多条语义输入
+    if args.prompts:
+        # 使用多条提示
+        if args.prompt or args.text_input:
+            logger.warning("--prompts 与 --prompt/--text-input 同时指定，将忽略 --prompt/--text-input")
+        text_input = args.prompts[0]  # 第一条作为主语义
+        multiple_text_inputs = args.prompts[1:] if len(args.prompts) > 1 else None
+        logger.info(f"使用多条文本提示: 主提示 {len(text_input)} 字符, 额外 {len(multiple_text_inputs) if multiple_text_inputs else 0} 条")
+    elif args.text_input:
+        text_input = load_text(args.text_input)
+        logger.info(f"从文件加载文本输入: {len(text_input)} 字符")
+    elif args.prompt:
+        text_input = args.prompt
+        logger.info(f"使用命令行提示文本: {len(text_input)} 字符")
+    
+    if text_input:
+        # 准备文本tensor和attention mask（仅用于第一个文本）
+        text_tensor = torch.tensor([ord(c) for c in text_input[:config.max_text_length]], dtype=torch.long)
+        if len(text_tensor) < config.max_text_length:
+            pad_len = config.max_text_length - len(text_tensor)
+            text_tensor = torch.cat([text_tensor, torch.zeros(pad_len, dtype=torch.long)])
+        text_attention_mask = torch.ones_like(text_tensor)
+    
+    # 执行推理
+    logger.info("开始推理...")
+    if modality == 'image':
+        result = infer_image(model, args.input, config, config.device, logger, 
+                            text_input=text_input, 
+                            text_attention_mask=text_attention_mask,
+                            multiple_text_inputs=multiple_text_inputs)
+    elif modality == 'text':
+        result = infer_text(model, args.input, config, config.device, logger)
+    elif modality == 'video':
+        result = infer_video(model, args.input, config, config.device, logger,
+                            text_input=text_input, 
+                            text_attention_mask=text_attention_mask,
+                            multiple_text_inputs=multiple_text_inputs)
+    else:
+        raise ValueError(f"不支持的模态类型: {modality}")
+    
+    # 保存结果
+    logger.info(f"保存结果到: {args.output}")
+    save_result(result, args.output, modality)
+    
+    logger.info("=" * 80)
+    logger.info("推理完成！")
+
+
+if __name__ == '__main__':
+    main()
+
+

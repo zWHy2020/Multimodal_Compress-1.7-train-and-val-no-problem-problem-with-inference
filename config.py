@@ -1,0 +1,215 @@
+"""
+多模态JSCC配置模块
+
+包含训练和评估的配置类，便于统一管理和共享参数。
+"""
+
+import os
+from datetime import datetime
+from typing import Tuple, List, Optional
+import logging
+
+
+class TrainingConfig:
+    """训练配置类"""
+    
+    def __init__(self):
+        # 基础设置
+        self.seed = 42
+        self.device = None  # 将在运行时设置
+        self.num_workers = 0  # 优化：增加数据加载workers以充分利用CPU资源，确保GPU流水线饱和
+        self.pin_memory = True
+        
+        # 日志设置
+        self.workdir = './checkpoints'
+        self.log_dir = './logs'
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        self.run_name = f'multimodal_jscc_{timestamp}'
+        self.save_dir = os.path.join(self.workdir, self.run_name)
+        self.log_file = os.path.join(self.log_dir, f'{self.run_name}.log')
+        
+        # 训练参数
+        self.num_epochs = 100
+        # 优化：通过梯度检查点释放显存，提高物理batch_size以加速训练
+        # 等效批次大小 = batch_size * gradient_accumulation_steps = 8 * 8 = 64（保持不变）
+        self.batch_size = 32  # 优化：从1提升到8，大幅减少迭代次数
+        self.learning_rate = 1e-5  # 修复：将初始学习率从1e-6提高到1e-4，以便学习率调度器能够正常工作
+        self.weight_decay = 1e-4
+        self.grad_clip_norm = 1.0
+        self.gradient_accumulation_steps = 2  # 优化：按比例降低，保持等效批次大小=8*8=64不变
+        self.use_amp = False  # 是否使用混合精度训练（自动混合精度）
+        
+        # 学习率调度
+        self.lr_scheduler = 'cosine'  # 'cosine', 'step', 'plateau'
+        self.lr_step_size = 30
+        self.lr_gamma = 0.1
+        self.lr_min = 1e-6  # 最小学习率，cosine scheduler会从learning_rate逐渐降到lr_min
+        
+        # 验证设置
+        self.val_freq = 10  # 每N个epoch验证一次（减少验证频率以加速训练）
+        self.save_freq = 20  # 每N个epoch保存一次模型（减少保存频率）
+        self.print_freq = 200  # 每N个step打印一次（减少打印频率以提升速度）
+        
+        # 损失权重（调整以平衡各模态损失）
+        self.text_weight = 0.1  # 文本损失通常较大，降低权重
+        self.image_weight = 1.0
+        self.video_weight = 1.0
+        self.reconstruction_weight = 1.0
+        self.perceptual_weight = 0.01  # 【重构】启用LPIPS感知损失以提升重建质量
+        self.temporal_weight = 0.05  # 降低时序损失权重
+        self.text_contrastive_weight = 0.0  # 路线1默认关闭文本-图像对比
+        self.video_text_contrastive_weight = 0.1  # 【新增】视频-文本对比损失权重
+        self.rate_weight = 1e-4  # 【新增】码率/能量约束权重
+        self.temporal_consistency_weight = 0.02  # 【新增】视频时序一致性正则权重
+        # 文本引导与条件约束（路线1默认）
+        self.use_text_guidance_image = False
+        self.use_text_guidance_video = True
+        self.enforce_text_condition = True
+        self.condition_margin_weight = 0.1
+        self.condition_margin = 0.05
+        self.condition_prob = 0.5
+        self.condition_only_low_snr = True
+        self.condition_low_snr_threshold = 5.0
+        
+        # SNR设置
+        self.train_snr_min = -5.0  # 训练时SNR范围
+        self.train_snr_max = 15.0
+        self.train_snr_random = False # 是否随机SNR
+        self.snr_db = 10.0
+        # 模型参数
+        self.vocab_size = 65536
+        self.text_embed_dim = 512
+        self.text_num_heads = 8
+        self.text_num_layers = 6
+        self.text_output_dim = 256
+        self.pretrained_model_name = 'swin_base_patch4_window7_224'
+        self.img_size = (224, 224)
+        self.patch_size = 4
+        self.img_window_size = 7
+        # 重构：减小Swin Transformer的深度和宽度以节省显存
+        self.img_embed_dims = [96, 192, 384, 768]  # 从 [96, 192, 384, 768] 减小
+        self.img_depths = [2, 2, 18, 2]  # 从 [2, 2, 6, 2] 减小
+        self.img_num_heads = [3, 6, 12, 24]  # 从 [3, 6, 12, 24] 减小
+        self.img_output_dim = 256
+        self.mlp_ratio = 4.0
+        
+        self.video_hidden_dim = 384
+        self.video_num_frames = 5
+        self.video_use_optical_flow = False  # 重构：默认禁用光流以节省显存，使用轻量级替代
+        self.video_use_convlstm = False  # 重构：默认禁用ConvLSTM以节省显存，使用轻量级时序卷积
+        self.video_output_dim = 256
+        
+        self.channel_type = "awgn"
+      
+        
+        # 数据路径和参数
+        self.data_dir = None
+        self.train_manifest = None
+        self.val_manifest = None
+        self.max_text_length = 512
+        self.max_video_frames = 3
+        self.max_samples = 65536  # 【Phase 4】默认最大样本数
+        self.allow_missing_modalities = False
+        self.strict_data_loading = True
+        
+        # 【Phase 1】迁移学习参数
+        self.pretrained = True  # 【Phase 4】默认启用预训练权重
+        self.freeze_encoder = False  # 是否冻结编码器主干（初始训练时可设为True）
+        self.pretrained_model_name = 'swin_small_patch4_window7_224'  # 预训练模型名称
+        
+        # 【Phase 3】对抗训练参数
+        self.use_adversarial = False  # 是否使用对抗训练（默认关闭，需要时可启用）
+        self.discriminator_weight = 0.01  # 【Phase 4】对抗损失权重（默认较小）
+        self.ddp_find_unused_parameters = True  # DDP下允许未使用参数（用于缺失模态场景）
+        self.use_quantization_noise = True  # 【新增】是否启用量化噪声模拟
+        self.quantization_noise_range = 0.5  # 【新增】量化噪声范围（均匀分布 [-r, r]）
+    def print_config(self, logger=None):
+        log_func = logger.info if logger else print
+        log_func("\n=== 当前生效的配置 (TrainingConfig) ===")
+        log_func(f"Image Embed Dims: {self.img_embed_dims}")
+        log_func(f"Image Depths: {self.img_depths}")
+        log_func(f"Use Adversarial: {getattr(self, 'use_adversarial', False)}")
+        log_func("=========================================\n")
+
+
+class EvaluationConfig:
+    """评估配置类"""
+    
+    def __init__(self):
+        # 基础设置
+        self.seed = 42
+        self.device = None  # 将在运行时设置
+        self.num_workers = 4
+        self.pin_memory = True
+        
+        # 日志设置
+        self.log_dir = './logs'
+        self.save_dir = './evaluation_results'
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        self.run_name = f'evaluation_{timestamp}'
+        self.log_file = os.path.join(self.log_dir, f'{self.run_name}.log')
+        self.result_dir = os.path.join(self.save_dir, self.run_name)
+        
+        # 模型路径
+        self.model_path = None  # 必须指定
+        
+        # 评估参数
+        self.batch_size = 8
+        self.test_num = None  # 测试样本数量，None表示全部
+        
+        # SNR和Rate列表
+        self.snr_list = [-5, -10, -5, 0, 5, 10, 15, 20]
+        self.rate_list = None  # Rate列表（如果模型支持），None表示使用默认rate
+        
+        # Patch-based推理设置（用于处理任意尺寸图像）
+        self.use_patch_inference = True
+        self.patch_size = 128  # patch大小
+        self.patch_overlap = 32  # patch重叠区域
+        
+        # 数据路径
+        self.data_dir = None
+        self.test_manifest = None
+        
+        # 图像保存设置
+        self.save_images = False
+        self.image_save_dir = None
+        
+        # 数据加载参数
+        self.image_size = (256, 256)
+        self.max_text_length = 512
+        self.max_video_frames = 10
+        
+        # 模型参数（用于加载模型时，通常从检查点恢复）
+        self.vocab_size = 10000
+        self.text_embed_dim = 512
+        self.text_num_heads = 8
+        self.text_num_layers = 6
+        self.text_output_dim = 256
+        
+        self.img_size = (224, 224)
+        self.img_patch_size = 4 
+        self.mlp_ratio = 4.0 # 注意：这是模型内部的patch_size，不同于推理时的patch_size
+        # 重构：减小Swin Transformer的深度和宽度以节省显存
+        self.img_embed_dims = [96, 192, 384, 768]  # 从 [96, 192, 384, 768] 减小
+        self.img_depths = [2, 2, 18, 2]  # 从 [2, 2, 6, 2] 减小
+        self.img_num_heads = [3, 6, 12, 24]  # 从 [3, 6, 12, 24] 减小
+        self.img_output_dim = 256
+        
+        self.video_hidden_dim = 256
+        self.video_num_frames = 3
+        self.video_use_optical_flow = False  # 重构：默认禁用光流以节省显存
+        self.video_use_convlstm = False  # 重构：默认禁用ConvLSTM以节省显存
+        self.video_output_dim = 256
+        
+        self.channel_type = "awgn"
+        self.snr_db = 10.0
+        # 文本引导与条件约束（评估侧保持与训练一致的开关）
+        self.use_text_guidance_image = False
+        self.use_text_guidance_video = True
+        self.enforce_text_condition = True
+        self.condition_prob = 0.0  # 评估默认不触发额外 condition-margin 计算
+        self.condition_margin = 0.05
+        self.condition_margin_weight = 0.1
+        self.condition_only_low_snr = True
+        self.condition_low_snr_threshold = 5.0
+
