@@ -682,7 +682,7 @@ def load_model(model_path: str, config: EvaluationConfig, device: torch.device, 
         #model_config = checkpoint['model_config']
         logger.info("✅ 发现 Checkpoint 中保存的模型配置，将直接使用它来初始化模型。")
         model_config = checkpoint['model_config']
-        model_config['pretrained'] = False
+        model_config['pretrained'] = checkpoint['model_config'].get('pretrained', False)
         model_config['freeze_encoder'] = False
         if 'img_embed_dims' in model_config:
             config.img_embed_dims = model_config['img_embed_dims']
