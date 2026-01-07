@@ -194,6 +194,7 @@ class EvaluationConfig:
         self.img_depths = [2, 2, 18, 2]  # 从 [2, 2, 6, 2] 减小
         self.img_num_heads = [3, 6, 12, 24]  # 从 [3, 6, 12, 24] 减小
         self.img_output_dim = 256
+        self.pretrained_model_name = None  # 推理时可手动指定，与训练保持一致
         
         self.video_hidden_dim = 256
         self.video_num_frames = 3
