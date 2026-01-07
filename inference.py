@@ -686,6 +686,17 @@ def load_model(model_path: str, config: EvaluationConfig, device: torch.device, 
         model_config['freeze_encoder'] = False
         if 'img_embed_dims' in model_config:
             config.img_embed_dims = model_config['img_embed_dims']
+        if getattr(config, "pretrained_model_name", None):
+            logger.info(
+                "使用命令行指定的 pretrained_model_name: %s",
+                config.pretrained_model_name,
+            )
+            model_config["pretrained_model_name"] = config.pretrained_model_name
+        elif model_config.get("pretrained", False) and "pretrained_model_name" not in model_config:
+            logger.warning(
+                "⚠️ Checkpoint 中缺少 pretrained_model_name，可能导致主干结构不匹配。"
+                "请在推理时使用 --pretrained-model-name 指定训练时的模型名称。"
+            )
     else:
         logger.warning("⚠️ Checkpoint 中未找到配置信息！将使用 EvaluationConfig 的默认值（极高风险！）")
         model_config = {
@@ -711,6 +722,8 @@ def load_model(model_path: str, config: EvaluationConfig, device: torch.device, 
             'snr_db': config.snr_db,
             'pretrained': False, # 推理时强制关闭
         }
+        if getattr(config, "pretrained_model_name", None):
+            model_config["pretrained_model_name"] = config.pretrained_model_name
     try:
          model = MultimodalJSCC(**model_config)
     except TypeError as e:
@@ -842,6 +855,12 @@ def main():
                        help='文本提示（直接输入文本，用于语义引导图像/视频解码）')
     parser.add_argument('--prompts', type=str, nargs='+', default=None,
                        help='多条文本提示（用于多条语义引导，与--prompt互斥）')
+    parser.add_argument(
+        '--pretrained-model-name',
+        type=str,
+        default=None,
+        help='手动指定训练时的预训练主干名称（例如 swin_small_patch4_window7_224）',
+    )
     args = parser.parse_args()
     
     # 设置随机种子
@@ -853,6 +872,7 @@ def main():
     config.model_path = args.model_path
     config.snr_db = args.snr
     config.use_patch_inference = not args.no_patch
+    config.pretrained_model_name = args.pretrained_model_name
     
     # 推断模态类型
     if args.modality is None:

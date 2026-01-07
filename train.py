@@ -1015,6 +1015,7 @@ def main():
         'channel_type': config.channel_type,
         'pretrained': getattr(config, 'pretrained', False),
         'freeze_encoder': getattr(config, 'freeze_encoder', False),
+        'pretrained_model_name': getattr(config, 'pretrained_model_name', None),
 
     }
     
