@@ -718,9 +718,24 @@ def load_model(model_path: str, config: EvaluationConfig, device: torch.device, 
         logger.error("这通常是因为训练时的代码版本与当前代码版本的参数列表不一致。")
         raise e
     m = model.image_encoder
-    print("layer1 downsample reduction:", m.layers[0].downsample.reduction.weight.shape if m.layers[0].downsample else None)
-    print("layer2 downsample reduction:", m.layers[1].downsample.reduction.weight.shape if m.layers[1].downsample else None)
-    print("layer3 downsample reduction:", m.layers[2].downsample.reduction.weight.shape if m.layers[2].downsample else None)
+    print(
+        "layer1 downsample reduction:",
+        m.layers[0].downsample.reduction.weight.shape
+        if hasattr(m.layers[0].downsample, "reduction")
+        else None,
+    )
+    print(
+        "layer2 downsample reduction:",
+        m.layers[1].downsample.reduction.weight.shape
+        if hasattr(m.layers[1].downsample, "reduction")
+        else None,
+    )
+    print(
+        "layer3 downsample reduction:",
+        m.layers[2].downsample.reduction.weight.shape
+        if hasattr(m.layers[2].downsample, "reduction")
+        else None,
+    )
     if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
         state_dict = checkpoint['model_state_dict']
     else:
