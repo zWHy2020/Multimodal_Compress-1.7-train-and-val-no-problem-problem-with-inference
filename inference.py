@@ -39,8 +39,16 @@ def pad_image(image: torch.Tensor, patch_size: int) -> Tuple[torch.Tensor, int, 
     padded_image = F.pad(image, (0, pad_w, 0, pad_h), mode='replicate')
     return padded_image, pad_h, pad_w
 def crop_image(image: torch.Tensor, pad_h: int, pad_w: int) -> torch.Tensor:
-    _, _, H, W = image.shape
-    return image[:, :, :H - pad_h, :W - pad_w]
+    if image.dim() == 5:
+        _, _, _, H, W = image.shape
+        return image[:, :, :, :H - pad_h, :W - pad_w]
+    if image.dim() == 4:
+        _, _, H, W = image.shape
+        return image[:, :, :H - pad_h, :W - pad_w]
+    if image.dim() == 3:
+        _, H, W = image.shape
+        return image[:, :H - pad_h, :W - pad_w]
+    raise ValueError(f"Unsupported image shape for cropping: {image.shape}")
 
 def load_image(image_path: str) -> torch.Tensor:
     """
