@@ -322,10 +322,9 @@ def merge_image_v2(
     weight_map = torch.clamp(weight_map, min=1e-8)
     output = output / weight_map
     
-    if squeeze_batch:
-        return output  # [C, H, W]
-    else:
+    if output.dim() == 3:
         return output.unsqueeze(0)  # [1, C, H, W]
+    return output
 
 
 def split_video_v2(
@@ -394,7 +393,9 @@ def merge_video_v2(
     for t in range(T):
         patches = patches_list[t]
         meta = meta_list[t]
-        frame = merge_image_v2(patches, meta)  # [C, H, W]
+        frame = merge_image_v2(patches, meta)
+        if frame.dim() == 4:
+            frame = frame.squeeze(0)  # [C, H, W]
         reconstructed_frames.append(frame)
     
     # 堆叠所有帧
