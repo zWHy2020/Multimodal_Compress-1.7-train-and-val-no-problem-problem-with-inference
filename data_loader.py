@@ -24,23 +24,28 @@ from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 
-
-def _default_image_transform(image_size: Tuple[int, int]) -> transforms.Compose:
-    return transforms.Compose(
-        [
-            transforms.Resize(image_size),
-            transforms.ToTensor(),
-        ]
-    )
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD = [0.229, 0.224, 0.225]
 
 
-def _default_video_transform(image_size: Tuple[int, int]) -> transforms.Compose:
-    return transforms.Compose(
-        [
-            transforms.Resize(image_size),
-            transforms.ToTensor(),
-        ]
-    )
+def _default_image_transform(image_size: Tuple[int, int], normalize: bool) -> transforms.Compose:
+    transform_steps = [
+        transforms.Resize(image_size),
+        transforms.ToTensor(),
+    ]
+    if normalize:
+        transform_steps.append(transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD))
+    return transforms.Compose(transform_steps)
+
+
+def _default_video_transform(image_size: Tuple[int, int], normalize: bool) -> transforms.Compose:
+    transform_steps = [
+        transforms.Resize(image_size),
+        transforms.ToTensor(),
+    ]
+    if normalize:
+        transform_steps.append(transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD))
+    return transforms.Compose(transform_steps)
 
 
 def _load_manifest(manifest: str) -> List[Dict[str, Any]]:
@@ -65,13 +70,14 @@ class MultimodalDataset(Dataset):
         allow_missing_modalities: bool = False,
         strict_mode: bool = True,
         required_modalities: Tuple[str, ...] = ("video", "text"),
+        normalize: bool = False,
         seed: Optional[int] = None,
     ):
         self.data_dir = data_dir
         self.data_list = list(data_list)
         self.text_tokenizer = text_tokenizer
-        self.image_transform = image_transform or _default_image_transform(image_size)
-        self.video_transform = video_transform or _default_video_transform(image_size)
+        self.image_transform = image_transform or _default_image_transform(image_size, normalize)
+        self.video_transform = video_transform or _default_video_transform(image_size, normalize)
         self.max_text_length = max_text_length
         self.max_video_frames = max_video_frames
         self.image_size = image_size
@@ -79,6 +85,7 @@ class MultimodalDataset(Dataset):
         self.allow_missing_modalities = allow_missing_modalities
         self.strict_mode = strict_mode
         self.required_modalities = required_modalities
+        self.normalize = normalize
         self.text_pad_token_id = (
             getattr(self.text_tokenizer, "pad_token_id", 0) if self.text_tokenizer is not None else 0
         )
@@ -337,6 +344,7 @@ class MultimodalDataLoader:
         allow_missing_modalities: bool = False,
         strict_mode: bool = True,
         required_modalities: Tuple[str, ...] = ("video", "text"),
+        normalize: bool = False,
         seed: Optional[int] = None,
     ):
         self.data_dir = data_dir
@@ -351,6 +359,7 @@ class MultimodalDataLoader:
         self.allow_missing_modalities = allow_missing_modalities
         self.strict_mode = strict_mode
         self.required_modalities = required_modalities
+        self.normalize = normalize
         self.seed = seed
 
     def create_dataset(
@@ -378,6 +387,7 @@ class MultimodalDataLoader:
             allow_missing_modalities=self.allow_missing_modalities,
             strict_mode=self.strict_mode,
             required_modalities=self.required_modalities,
+            normalize=self.normalize,
             seed=self.seed,
         )
 
@@ -403,3 +413,51 @@ class MultimodalDataLoader:
             prefetch_factor=actual_prefetch_factor,
             persistent_workers=self.num_workers > 0,
         )
+
+
+def _print_sample_shapes(sample: Dict[str, Any], index: int) -> None:
+    def shape_of(value: Any) -> str:
+        if isinstance(value, torch.Tensor):
+            return str(tuple(value.shape))
+        return str(type(value))
+
+    print(f"Sample {index}:")
+    for key in ("video", "image", "text", "text_attention_mask", "video_frame_mask"):
+        if key in sample:
+            print(f"  {key}: {shape_of(sample[key])}")
+    print(f"  meta: {sample.get('meta', {})}")
+    print(f"  dropped: {sample.get('_dropped')}")
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="最小自测：随机读取 manifest 样本并打印形状")
+    parser.add_argument("--manifest", type=str, required=True, help="Manifest v2 路径")
+    parser.add_argument("--data_dir", type=str, default=".", help="数据根目录")
+    parser.add_argument("--max_video_frames", type=int, default=10)
+    parser.add_argument("--max_text_length", type=int, default=64)
+    parser.add_argument("--image_size", type=int, nargs=2, default=(224, 224))
+    parser.add_argument("--normalize", action="store_true", help="启用 ImageNet 归一化")
+    args = parser.parse_args()
+
+    manifest_data = _load_manifest(args.manifest)
+    if len(manifest_data) < 2:
+        raise RuntimeError("manifest 样本数不足 2 条，无法执行自测")
+
+    dataset = MultimodalDataset(
+        data_dir=args.data_dir,
+        data_list=manifest_data,
+        max_text_length=args.max_text_length,
+        max_video_frames=args.max_video_frames,
+        image_size=tuple(args.image_size),
+        is_train=False,
+        allow_missing_modalities=True,
+        strict_mode=False,
+        normalize=args.normalize,
+    )
+
+    indices = random.sample(range(len(dataset)), k=2)
+    for idx in indices:
+        sample = dataset[idx]
+        _print_sample_shapes(sample, idx)

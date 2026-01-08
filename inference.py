@@ -28,6 +28,9 @@ from utils_check import print_model_structure_info, check_state_dict_compatibili
 import cv2
 import torch.nn.functional as F
 
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD = [0.229, 0.224, 0.225]
+
 def pad_image(image: torch.Tensor, patch_size: int) -> Tuple[torch.Tensor, int, int]:
     if image.dim() == 4:
         _, _, H, W = image.shape
@@ -65,7 +68,7 @@ def load_image(image_path: str) -> torch.Tensor:
     # ImageNet归一化
     transform = transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
     ])
     
     image_tensor = transform(image)
@@ -119,7 +122,7 @@ def load_video(video_path: str, max_frames: int = 10) -> torch.Tensor:
     # ImageNet归一化
     transform = transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
     ])
     
     video_tensor = torch.stack([transform(frame) for frame in frames])
@@ -138,13 +141,54 @@ def denormalize_image(image_tensor: torch.Tensor) -> np.ndarray:
     """
     if image_tensor.dim() == 4:
         image_tensor = image_tensor[0]  # [B, C, H, W] -> [C, H, W]
-    mean = torch.tensor([0.485, 0.456, 0.406], device=image_tensor.device).view(3, 1, 1)
-    std = torch.tensor([0.229, 0.224, 0.225], device=image_tensor.device).view(3, 1, 1)
+    mean = torch.tensor(IMAGENET_MEAN, device=image_tensor.device).view(3, 1, 1)
+    std = torch.tensor(IMAGENET_STD, device=image_tensor.device).view(3, 1, 1)
     image_tensor = image_tensor * std + mean
     
     image_tensor = torch.clamp(image_tensor, 0, 1)
     image_np = (image_tensor.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
     return image_np
+
+
+def denormalize_video_frame(frame_tensor: torch.Tensor) -> np.ndarray:
+    frame = denormalize_image(frame_tensor)
+    return cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+
+def get_video_fps(video_path: str, default_fps: float) -> float:
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return default_fps
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    cap.release()
+    if fps and fps > 0:
+        return fps
+    return default_fps
+
+
+def register_branch_hooks(model: MultimodalJSCC) -> Tuple[Dict[str, int], List[Any]]:
+    counters = {
+        "image_encoder": 0,
+        "video_encoder": 0,
+        "image_decoder": 0,
+        "video_decoder": 0,
+    }
+    handles = []
+
+    def make_hook(name: str):
+        def hook(_module, _inputs, _outputs):
+            counters[name] += 1
+        return hook
+
+    if hasattr(model, "image_encoder"):
+        handles.append(model.image_encoder.register_forward_hook(make_hook("image_encoder")))
+    if hasattr(model, "video_encoder"):
+        handles.append(model.video_encoder.register_forward_hook(make_hook("video_encoder")))
+    if hasattr(model, "image_decoder"):
+        handles.append(model.image_decoder.register_forward_hook(make_hook("image_decoder")))
+    if hasattr(model, "video_decoder"):
+        handles.append(model.video_decoder.register_forward_hook(make_hook("video_decoder")))
+    return counters, handles
  
     #image_tensor = torch.clamp(image_tensor, 0, 1)
     
@@ -438,7 +482,9 @@ def infer_video(
     logger: logging.Logger,
     text_input: Optional[str] = None,
     text_attention_mask: Optional[torch.Tensor] = None,
-    multiple_text_inputs: Optional[List[str]] = None
+    multiple_text_inputs: Optional[List[str]] = None,
+    diagnose_branches: bool = False,
+    default_fps: float = 10.0,
 ) -> Dict[str, Any]:
     """
     对视频进行推理
@@ -455,6 +501,7 @@ def infer_video(
     """
     logger.info(f"加载视频: {video_path}")
     video = load_video(video_path, max_frames=config.max_video_frames)  # [T, C, H, W]
+    fps = get_video_fps(video_path, default_fps)
     original_shape = video.shape
     
     logger.info(f"视频尺寸: {original_shape[0]}帧, {original_shape[2]}x{original_shape[3]}")
@@ -510,6 +557,12 @@ def infer_video(
                 logger.info(f"使用多条语义上下文: {len(multiple_semantic_contexts)} 条")
                 del semantic_contexts_list
     
+    branch_counters: Dict[str, int] = {}
+    hook_handles: List[Any] = []
+    if diagnose_branches:
+        branch_counters, hook_handles = register_branch_hooks(model)
+    path_used = "standard"
+
     model.eval()
     with torch.no_grad():
         # 检查是否需要patch推理
@@ -524,6 +577,7 @@ def infer_video(
         need_patch = (original_shape[2] != expected_h or original_shape[3] != expected_w)
         need_patch = (original_shape[2] != expected_h or original_shape[3] != expected_w)
         if need_patch and config.use_patch_inference:
+            path_used = "patch-based"
             logger.info(f"使用 patch-based 推理...")
             patches_list, meta_list = split_video_v2(padded_video, expected_h, config.patch_overlap)
         #if need_patch and config.use_patch_inference:
@@ -616,6 +670,7 @@ def infer_video(
             
 
         else:
+            path_used = "standard"
             logger.info("使用标准推理")
             video_input = padded_video.unsqueeze(0).to(device)
             results = model(video_input=video_input, snr_db=config.snr_db)
@@ -624,14 +679,47 @@ def infer_video(
                 reconstructed_video = reconstructed_video.squeeze(0)
             reconstructed_video = crop_image(reconstructed_video, pad_h, pad_w)
     
+    if diagnose_branches:
+        for handle in hook_handles:
+            handle.remove()
+        logger.info(
+            "[BranchDiagnose] image_encoder_calls=%d, video_encoder_calls=%d, image_decoder_calls=%d, video_decoder_calls=%d",
+            branch_counters.get("image_encoder", 0),
+            branch_counters.get("video_encoder", 0),
+            branch_counters.get("image_decoder", 0),
+            branch_counters.get("video_decoder", 0),
+        )
+        if path_used == "patch-based":
+            logger.warning("[BranchDiagnose] 推理路径: patch-based (split_video_v2 / merge_video_v2)")
+            logger.warning(
+                "[BranchDiagnose] 当前 patch-based 路径逐帧调用 image 编解码，视频分支未参与。"
+                "如需确保视频分支参与，请使用 --no-patch 或实现 clip-level patch 视频推理。"
+            )
+        else:
+            logger.info("[BranchDiagnose] 推理路径: standard (model(video_input=...))")
+
+        if branch_counters.get("video_encoder", 0) == 0 and branch_counters.get("image_encoder", 0) > 0:
+            logger.warning("[BranchDiagnose] WARNING：视频推理退化为逐帧图像路径（视频分支未参与）")
+        elif branch_counters.get("video_encoder", 0) > 0 and branch_counters.get("video_decoder", 0) > 0:
+            logger.info("[BranchDiagnose] OK：视频分支生效")
+
     return {
         'original': video.cpu(),
         'reconstructed': reconstructed_video.cpu(),
-        'shape': original_shape
+        'shape': original_shape,
+        'fps': fps,
+        'path_used': path_used,
     }
 
 
-def save_result(result: Dict[str, Any], output_path: str, modality: str):
+def save_result(
+    result: Dict[str, Any],
+    output_path: str,
+    modality: str,
+    video_fps: float = 10.0,
+    save_video_mp4: bool = True,
+    save_video_frames: bool = False,
+):
     """
     保存推理结果
     
@@ -655,18 +743,41 @@ def save_result(result: Dict[str, Any], output_path: str, modality: str):
             f.write(f"原始文本:\n{result['original']}\n\n")
             f.write(f"重建文本（tensor）:\n{result['reconstructed']}\n")
     elif modality == 'video':
-        # 保存视频帧（作为图像序列）
-        os.makedirs(output_path, exist_ok=True)
         reconstructed = result['reconstructed']
         if reconstructed.dim() == 5:
             reconstructed = reconstructed[0]  # [B, T, C, H, W] -> [T, C, H, W]
-        
-        T = reconstructed.shape[0]
-        for t in range(T):
-            frame = reconstructed[t]  # [C, H, W]
-            frame_np = denormalize_image(frame)
-            frame_path = os.path.join(output_path, f'frame_{t:04d}.png')
-            Image.fromarray(frame_np).save(frame_path)
+
+        if output_path.lower().endswith(".mp4"):
+            mp4_path = output_path
+            frames_dir = None
+        else:
+            os.makedirs(output_path, exist_ok=True)
+            mp4_path = os.path.join(output_path, "reconstructed.mp4")
+            frames_dir = os.path.join(output_path, "frames")
+
+        if save_video_mp4:
+            first_frame = reconstructed[0]
+            frame_np = denormalize_video_frame(first_frame)
+            height, width = frame_np.shape[:2]
+            writer = cv2.VideoWriter(
+                mp4_path,
+                cv2.VideoWriter_fourcc(*"mp4v"),
+                video_fps,
+                (width, height),
+            )
+            for t in range(reconstructed.shape[0]):
+                frame = denormalize_video_frame(reconstructed[t])
+                writer.write(frame)
+            writer.release()
+
+        if save_video_frames:
+            if frames_dir is None:
+                frames_dir = os.path.splitext(output_path)[0] + "_frames"
+            os.makedirs(frames_dir, exist_ok=True)
+            for t in range(reconstructed.shape[0]):
+                frame = denormalize_image(reconstructed[t])
+                frame_path = os.path.join(frames_dir, f"frame_{t:04d}.png")
+                Image.fromarray(frame).save(frame_path)
 
 
 def load_model(model_path: str, config: EvaluationConfig, device: torch.device, logger: logging.Logger) -> MultimodalJSCC:
@@ -857,6 +968,15 @@ def main():
                        default=None, help='模态类型（如果不指定，将从文件扩展名推断）')
     parser.add_argument('--snr', type=float, default=10.0, help='信噪比 (dB)')
     parser.add_argument('--no-patch', action='store_true', help='禁用patch-based推理')
+    parser.add_argument('--video_fps', type=float, default=10.0, help='视频保存帧率')
+    parser.add_argument(
+        '--save_video_mp4',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='保存视频 mp4',
+    )
+    parser.add_argument('--save_video_frames', action='store_true', help='保存视频帧序列')
+    parser.add_argument('--diagnose_branches', action='store_true', help='诊断视频分支调用情况')
     parser.add_argument('--text-input', type=str, default=None, 
                        help='文本输入路径（用于语义引导图像/视频解码）')
     parser.add_argument('--prompt', type=str, default=None,
@@ -904,7 +1024,7 @@ def main():
         elif modality == 'text':
             args.output = f'{base_name}_reconstructed.txt'
         elif modality == 'video':
-            args.output = f'{base_name}_reconstructed_frames'
+            args.output = f'{base_name}_reconstructed'
     else:
         # 【修复】处理用户提供的输出路径
         # 检查输出路径是否是目录或没有扩展名
@@ -926,8 +1046,8 @@ def main():
             elif modality == 'text':
                 args.output = os.path.join(args.output, f'{base_name}_reconstructed.txt')
             elif modality == 'video':
-                # 视频输出是目录
-                args.output = os.path.join(args.output, f'{base_name}_reconstructed_frames')
+                # 视频输出使用目录
+                args.output = os.path.join(args.output, f'{base_name}_reconstructed')
         elif not output_ext:
             # 输出路径是文件路径但没有扩展名，需要添加扩展名
             input_ext = os.path.splitext(args.input)[1].lower()
@@ -945,7 +1065,12 @@ def main():
     
     # 创建输出目录
     if modality == 'video':
-        makedirs(args.output)
+        if not args.output.lower().endswith(".mp4"):
+            makedirs(args.output)
+        else:
+            output_dir = os.path.dirname(args.output)
+            if output_dir:
+                makedirs(output_dir)
     else:
         # 对于图像和文本，确保输出目录存在
         output_dir = os.path.dirname(args.output)
@@ -1016,13 +1141,22 @@ def main():
         result = infer_video(model, args.input, config, config.device, logger,
                             text_input=text_input, 
                             text_attention_mask=text_attention_mask,
-                            multiple_text_inputs=multiple_text_inputs)
+                            multiple_text_inputs=multiple_text_inputs,
+                            diagnose_branches=args.diagnose_branches,
+                            default_fps=args.video_fps)
     else:
         raise ValueError(f"不支持的模态类型: {modality}")
     
     # 保存结果
     logger.info(f"保存结果到: {args.output}")
-    save_result(result, args.output, modality)
+    save_result(
+        result,
+        args.output,
+        modality,
+        video_fps=result.get("fps", args.video_fps),
+        save_video_mp4=args.save_video_mp4,
+        save_video_frames=args.save_video_frames,
+    )
     
     logger.info("=" * 80)
     logger.info("推理完成！")
