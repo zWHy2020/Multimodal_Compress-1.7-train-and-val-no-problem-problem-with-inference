@@ -12,11 +12,13 @@
 
 import argparse
 import collections
+import csv
 import hashlib
 import json
 import logging
 import os
-from typing import Any, Dict, List, Optional, Tuple
+import random
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import cv2
 import requests
@@ -150,6 +152,216 @@ def aggregate_annotations(annotations: Dict[str, Any]) -> Tuple[Dict[str, Dict[s
     return video_info, captions_by_video
 
 
+def detect_chatscene_video_dir(data_dir: str, video_dir: Optional[str]) -> str:
+    if video_dir:
+        return video_dir
+    candidate_video = os.path.join(data_dir, "video")
+    candidate_videos = os.path.join(data_dir, "videos")
+    if os.path.isdir(candidate_video):
+        return candidate_video
+    if os.path.isdir(candidate_videos):
+        return candidate_videos
+    return candidate_video
+
+
+def detect_chatscene_keyframes_dir(data_dir: str, keyframes_dir: Optional[str]) -> str:
+    if keyframes_dir:
+        return keyframes_dir
+    candidate_key_frames = os.path.join(data_dir, "key_frames")
+    candidate_keyframes = os.path.join(data_dir, "keyframes")
+    if os.path.isdir(candidate_key_frames):
+        return candidate_key_frames
+    if os.path.isdir(candidate_keyframes):
+        return candidate_keyframes
+    return candidate_key_frames
+
+
+def detect_chatscene_csv(data_dir: str, csv_path: Optional[str]) -> str:
+    if csv_path:
+        return csv_path
+    candidate = os.path.join(data_dir, "scenario_descriptions.csv")
+    return candidate
+
+
+def _read_split_file(path: str) -> List[str]:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Split 文件不存在: {path}")
+    with open(path, "r", encoding="utf-8") as f:
+        return [line.strip() for line in f if line.strip()]
+
+
+def _choose_text_col(headers: List[str], text_col: Optional[str]) -> str:
+    if text_col:
+        if text_col not in headers:
+            raise ValueError(f"--text_col={text_col} 不在 CSV 列中: {headers}")
+        return text_col
+    lowered = [h.lower() for h in headers]
+    for idx, name in enumerate(lowered):
+        if "description" in name:
+            return headers[idx]
+    for idx, name in enumerate(lowered):
+        if "text" in name:
+            return headers[idx]
+    raise ValueError("未找到可用的文本列，请使用 --text_col 指定")
+
+
+def _choose_video_id_col(headers: List[str], video_id_col: Optional[str]) -> str:
+    if video_id_col:
+        if video_id_col not in headers:
+            raise ValueError(f"--video_id_col={video_id_col} 不在 CSV 列中: {headers}")
+        return video_id_col
+    lowered = [h.lower() for h in headers]
+    for idx, name in enumerate(lowered):
+        if "video" in name and "id" in name:
+            return headers[idx]
+    if "video_id" in lowered:
+        return headers[lowered.index("video_id")]
+    raise ValueError("无法识别 video_id 列，请使用 --video_id_col 指定")
+
+
+def _collect_keyframes(keyframes_dir: str, video_id: str) -> List[str]:
+    candidates: List[str] = []
+    subdir = os.path.join(keyframes_dir, video_id)
+    if os.path.isdir(subdir):
+        for fname in sorted(os.listdir(subdir)):
+            if fname.lower().endswith((".jpg", ".jpeg", ".png")):
+                candidates.append(os.path.join(subdir, fname))
+        if candidates:
+            return candidates
+    for fname in sorted(os.listdir(keyframes_dir)):
+        lower = fname.lower()
+        if not lower.endswith((".jpg", ".jpeg", ".png")):
+            continue
+        if fname.startswith(f"{video_id}_") or fname.startswith(video_id):
+            candidates.append(os.path.join(keyframes_dir, fname))
+    return candidates
+
+
+def _dedupe_texts(texts: Iterable[str]) -> List[str]:
+    seen = set()
+    cleaned: List[str] = []
+    for text in texts:
+        if text is None:
+            continue
+        stripped = str(text).strip()
+        if not stripped or stripped in seen:
+            continue
+        seen.add(stripped)
+        cleaned.append(stripped)
+    return cleaned
+
+
+def build_chatscene_manifests(
+    data_dir: str,
+    video_dir: str,
+    keyframes_dir: str,
+    csv_path: str,
+    splits_dir: str,
+    manifest_suffix: str,
+    max_samples: Optional[int],
+    num_keyframes: Optional[int],
+    strict: bool,
+    text_col: Optional[str],
+    video_id_col: Optional[str],
+    seed: int = 42,
+) -> None:
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"未找到 CSV 文件: {csv_path}")
+    train_ids = _read_split_file(os.path.join(splits_dir, "train.txt"))
+    val_ids = _read_split_file(os.path.join(splits_dir, "val.txt"))
+    test_ids = _read_split_file(os.path.join(splits_dir, "test.txt"))
+
+    with open(csv_path, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        headers = reader.fieldnames or []
+        video_col = _choose_video_id_col(headers, video_id_col)
+        text_column = _choose_text_col(headers, text_col)
+        text_by_video: Dict[str, List[str]] = collections.defaultdict(list)
+        for row in reader:
+            vid = str(row.get(video_col, "")).strip()
+            if not vid:
+                continue
+            text_by_video[vid].append(row.get(text_column, ""))
+
+    rng = random.Random(seed)
+    stats = {
+        "missing_video": 0,
+        "missing_keyframes": 0,
+        "missing_text": 0,
+        "total_samples": 0,
+        "keyframe_dist": [],
+        "text_dist": [],
+    }
+
+    def build_entries(video_ids: List[str], split_name: str) -> List[Dict[str, Any]]:
+        entries: List[Dict[str, Any]] = []
+        for vid in video_ids:
+            if max_samples and stats["total_samples"] >= max_samples:
+                break
+            video_path = os.path.join(video_dir, f"{vid}.mp4")
+            if not os.path.exists(video_path):
+                stats["missing_video"] += 1
+                if strict:
+                    continue
+                video_rel = ""
+            else:
+                video_rel = os.path.relpath(video_path, data_dir)
+            keyframes = _collect_keyframes(keyframes_dir, vid)
+            if num_keyframes and keyframes:
+                if split_name == "train":
+                    if len(keyframes) > num_keyframes:
+                        keyframes = rng.sample(keyframes, num_keyframes)
+                else:
+                    keyframes = keyframes[:num_keyframes]
+            if not keyframes:
+                stats["missing_keyframes"] += 1
+                if strict:
+                    continue
+            texts = _dedupe_texts(text_by_video.get(vid, []))
+            if not texts:
+                stats["missing_text"] += 1
+                if strict:
+                    continue
+            entry = {
+                "video": {"file": video_rel},
+                "image": {"files": [os.path.relpath(p, data_dir) for p in keyframes]},
+                "text": {"texts": texts},
+                "meta": {"video_id": vid},
+            }
+            entries.append(entry)
+            stats["total_samples"] += 1
+            stats["keyframe_dist"].append(len(keyframes))
+            stats["text_dist"].append(len(texts))
+        return entries
+
+    train_entries = build_entries(train_ids, "train")
+    val_entries = build_entries(val_ids, "val")
+    test_entries = build_entries(test_ids, "test")
+
+    suffix = manifest_suffix.strip()
+    if suffix and not suffix.startswith("_"):
+        suffix = "_" + suffix
+    train_manifest_path = os.path.join(data_dir, f"train_manifest{suffix}.json")
+    val_manifest_path = os.path.join(data_dir, f"val_manifest{suffix}.json")
+    test_manifest_path = os.path.join(data_dir, f"test_manifest{suffix}.json")
+
+    save_manifest(train_entries, train_manifest_path)
+    save_manifest(val_entries, val_manifest_path)
+    save_manifest(test_entries, test_manifest_path)
+
+    summarize_stats(
+        {
+            "missing_video": stats["missing_video"],
+            "missing_keyframes": stats["missing_keyframes"],
+            "failed_keyframe": 0,
+            "total_videos": stats["total_samples"],
+            "unique_video_ids": set(),
+            "caption_dist": stats["text_dist"],
+            "keyframe_dist": stats["keyframe_dist"],
+        }
+    )
+
+
 def build_manifest_entries(
     data_dir: str,
     keyframe_dir: str,
@@ -238,6 +450,7 @@ def save_manifest(entries: List[Dict[str, Any]], path: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="生成多模态JSCC manifest v2（每视频一条记录）")
+    parser.add_argument("--dataset", type=str, choices=["msrvtt", "chatscene_v1"], default="msrvtt")
     parser.add_argument("--data_dir", type=str, default="./data", help="数据集根目录")
     parser.add_argument("--keyframe_dir", type=str, default="keyframes", help="关键帧相对/绝对目录（默认 data_dir/keyframes）")
     parser.add_argument("--num_keyframes", type=int, default=4, help="每个视频提取的关键帧数量")
@@ -246,53 +459,84 @@ def main() -> None:
     parser.add_argument("--manifest_suffix", type=str, default="_v2", help="输出文件后缀，例如 _v2 -> train_manifest_v2.json")
     parser.add_argument("--keep_legacy", action="store_true", help="同时保留旧版 train_manifest.json/val_manifest.json（不覆盖）")
     parser.add_argument("--verbose", action="store_true", help="启用 DEBUG 日志")
+    parser.add_argument("--video_dir", type=str, default=None, help="ChatScene-v1 视频目录（默认 data_dir/video 或 data_dir/videos）")
+    parser.add_argument("--keyframes_dir", type=str, default=None, help="ChatScene-v1 关键帧目录（默认 data_dir/key_frames 或 data_dir/keyframes）")
+    parser.add_argument("--csv_path", type=str, default=None, help="ChatScene-v1 CSV 路径（默认 data_dir/scenario_descriptions.csv）")
+    parser.add_argument("--splits_dir", type=str, default=None, help="ChatScene-v1 划分目录（默认 data_dir/splits）")
+    parser.add_argument(
+        "--strict",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="严格模式：缺失视频/关键帧/文本时跳过",
+    )
+    parser.add_argument("--text_col", type=str, default=None, help="ChatScene-v1 CSV 文本列名")
+    parser.add_argument("--video_id_col", type=str, default=None, help="ChatScene-v1 CSV video_id 列名")
     args = parser.parse_args()
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
     os.makedirs(args.data_dir, exist_ok=True)
-    keyframe_dir = args.keyframe_dir
-    if not os.path.isabs(keyframe_dir):
-        keyframe_dir = os.path.join(args.data_dir, keyframe_dir)
+    if args.dataset == "msrvtt":
+        keyframe_dir = args.keyframe_dir
+        if not os.path.isabs(keyframe_dir):
+            keyframe_dir = os.path.join(args.data_dir, keyframe_dir)
 
-    downloader = MSRVTTDatasetDownloader(args.data_dir)
-    if not downloader.download_annotation():
-        raise RuntimeError("无法获取 train_val_videodatainfo.json")
-    annotations = downloader.load_annotations()
-    video_info, captions_by_video = aggregate_annotations(annotations)
-    if args.max_samples:
-        # 仅保留前 max_samples 个 video_id
-        limited_keys = list(video_info.keys())[: args.max_samples]
-        video_info = {vid: video_info[vid] for vid in limited_keys}
-    video_root = detect_video_root(args.data_dir)
-    train_entries, val_entries, stats = build_manifest_entries(
-        data_dir=args.data_dir,
-        keyframe_dir=keyframe_dir,
-        video_root=video_root,
-        video_info=video_info,
-        captions_by_video=captions_by_video,
-        num_keyframes=args.num_keyframes,
-        downloader=downloader,
-        force_download=args.force_download,
-    )
+        downloader = MSRVTTDatasetDownloader(args.data_dir)
+        if not downloader.download_annotation():
+            raise RuntimeError("无法获取 train_val_videodatainfo.json")
+        annotations = downloader.load_annotations()
+        video_info, captions_by_video = aggregate_annotations(annotations)
+        if args.max_samples:
+            # 仅保留前 max_samples 个 video_id
+            limited_keys = list(video_info.keys())[: args.max_samples]
+            video_info = {vid: video_info[vid] for vid in limited_keys}
+        video_root = detect_video_root(args.data_dir)
+        train_entries, val_entries, stats = build_manifest_entries(
+            data_dir=args.data_dir,
+            keyframe_dir=keyframe_dir,
+            video_root=video_root,
+            video_info=video_info,
+            captions_by_video=captions_by_video,
+            num_keyframes=args.num_keyframes,
+            downloader=downloader,
+            force_download=args.force_download,
+        )
 
-    suffix = args.manifest_suffix.strip()
-    if suffix and not suffix.startswith("_"):
-        suffix = "_" + suffix
-    train_manifest_path = os.path.join(args.data_dir, f"train_manifest{suffix}.json")
-    val_manifest_path = os.path.join(args.data_dir, f"val_manifest{suffix}.json")
-    save_manifest(train_entries, train_manifest_path)
-    save_manifest(val_entries, val_manifest_path)
-    summarize_stats(stats)
+        suffix = args.manifest_suffix.strip()
+        if suffix and not suffix.startswith("_"):
+            suffix = "_" + suffix
+        train_manifest_path = os.path.join(args.data_dir, f"train_manifest{suffix}.json")
+        val_manifest_path = os.path.join(args.data_dir, f"val_manifest{suffix}.json")
+        save_manifest(train_entries, train_manifest_path)
+        save_manifest(val_entries, val_manifest_path)
+        summarize_stats(stats)
 
-    if args.keep_legacy:
-        legacy_train = os.path.join(args.data_dir, "train_manifest.json")
-        legacy_val = os.path.join(args.data_dir, "val_manifest.json")
-        if not os.path.exists(legacy_train):
-            save_manifest(train_entries, legacy_train)
-        if not os.path.exists(legacy_val):
-            save_manifest(val_entries, legacy_val)
+        if args.keep_legacy:
+            legacy_train = os.path.join(args.data_dir, "train_manifest.json")
+            legacy_val = os.path.join(args.data_dir, "val_manifest.json")
+            if not os.path.exists(legacy_train):
+                save_manifest(train_entries, legacy_train)
+            if not os.path.exists(legacy_val):
+                save_manifest(val_entries, legacy_val)
+    else:
+        video_dir = detect_chatscene_video_dir(args.data_dir, args.video_dir)
+        keyframes_dir = detect_chatscene_keyframes_dir(args.data_dir, args.keyframes_dir)
+        csv_path = detect_chatscene_csv(args.data_dir, args.csv_path)
+        splits_dir = args.splits_dir or os.path.join(args.data_dir, "splits")
+        build_chatscene_manifests(
+            data_dir=args.data_dir,
+            video_dir=video_dir,
+            keyframes_dir=keyframes_dir,
+            csv_path=csv_path,
+            splits_dir=splits_dir,
+            manifest_suffix=args.manifest_suffix,
+            max_samples=args.max_samples,
+            num_keyframes=args.num_keyframes,
+            strict=args.strict,
+            text_col=args.text_col,
+            video_id_col=args.video_id_col,
+        )
 
 
 if __name__ == "__main__":
