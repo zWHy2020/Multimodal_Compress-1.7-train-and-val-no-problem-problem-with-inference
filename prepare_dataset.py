@@ -227,10 +227,12 @@ def _collect_keyframes(keyframes_dir: str, video_id: str) -> List[str]:
         behavior = f"{parts[2]}_{parts[3]}"
         clip = "_".join(parts[4:])
         nested_dir = os.path.join(keyframes_dir, scenario, behavior, clip)
-        if os.path.isdir(nested_dir):
-            for fname in sorted(os.listdir(nested_dir)):
+        for candidate_dir in (nested_dir, os.path.join(nested_dir, "frames"), os.path.join(nested_dir, "keyframes")):
+            if not os.path.isdir(candidate_dir):
+                continue
+            for fname in sorted(os.listdir(candidate_dir)):
                 if fname.lower().endswith((".jpg", ".jpeg", ".png")):
-                    candidates.append(os.path.join(nested_dir, fname))
+                    candidates.append(os.path.join(candidate_dir, fname))
             if candidates:
                 return candidates
     subdir = os.path.join(keyframes_dir, video_id)
