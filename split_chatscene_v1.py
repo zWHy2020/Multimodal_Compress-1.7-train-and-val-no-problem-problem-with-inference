@@ -62,16 +62,27 @@ def _read_csv_rows(csv_path: str) -> Tuple[List[Dict[str, str]], List[str]]:
     return rows, headers
 
 
-def _scan_video_ids(video_dir: str) -> Dict[str, str]:
+def _scan_video_ids(video_dir: str) -> Tuple[Dict[str, str], Dict[str, List[str]]]:
     if not os.path.isdir(video_dir):
         raise FileNotFoundError(f"未找到视频目录: {video_dir}")
     video_ids: Dict[str, str] = {}
-    for fname in os.listdir(video_dir):
-        lower = fname.lower()
-        if lower.endswith(".mp4") or lower.endswith(".avi"):
-            video_id = os.path.splitext(fname)[0]
-            video_ids[video_id] = fname
-    return video_ids
+    group_map: Dict[str, List[str]] = {}
+    for root, dirs, files in os.walk(video_dir):
+        dirs.sort()
+        files.sort()
+        rel_dir = os.path.relpath(root, video_dir)
+        rel_dir = "" if rel_dir == "." else rel_dir
+        group_id = rel_dir.replace(os.sep, "_") if rel_dir else ""
+        for fname in files:
+            lower = fname.lower()
+            if lower.endswith(".mp4") or lower.endswith(".avi"):
+                stem = os.path.splitext(fname)[0]
+                video_id = f"{group_id}_{stem}" if group_id else stem
+                rel_path = os.path.join(rel_dir, fname) if rel_dir else fname
+                video_ids[video_id] = rel_path
+                group_key = group_id or stem
+                group_map.setdefault(group_key, []).append(video_id)
+    return video_ids, group_map
 
 
 def _assign_groups(
@@ -134,7 +145,7 @@ def main() -> None:
 
     rows, headers = _read_csv_rows(csv_path)
     video_id_col = _choose_video_id_col(headers, args.video_id_col)
-    available_videos = _scan_video_ids(video_dir)
+    available_videos, video_groups = _scan_video_ids(video_dir)
     available_ids = set(available_videos.keys())
 
     csv_video_ids = []
@@ -143,9 +154,18 @@ def main() -> None:
         if vid:
             csv_video_ids.append(vid)
 
-    matched_ids = sorted({vid for vid in csv_video_ids if vid in available_ids})
-    missing_videos = sorted({vid for vid in csv_video_ids if vid not in available_ids})
-    extra_videos = sorted(available_ids - set(csv_video_ids))
+    matched_set = set()
+    missing_videos = set()
+    for vid in csv_video_ids:
+        if vid in video_groups:
+            matched_set.update(video_groups[vid])
+        elif vid in available_ids:
+            matched_set.add(vid)
+        else:
+            missing_videos.add(vid)
+    matched_ids = sorted(matched_set)
+    missing_videos = sorted(missing_videos)
+    extra_videos = sorted(available_ids - matched_set)
 
     rng = random.Random(args.seed)
     group_cols = []
@@ -162,10 +182,14 @@ def main() -> None:
         group_map: Dict[str, List[str]] = {}
         for row in rows:
             vid = str(row.get(video_id_col, "")).strip()
-            if vid not in available_ids:
+            if vid in video_groups:
+                ids = video_groups[vid]
+            elif vid in available_ids:
+                ids = [vid]
+            else:
                 continue
             key = "|".join(str(row.get(col, "")).strip() for col in group_cols)
-            group_map.setdefault(key, []).append(vid)
+            group_map.setdefault(key, []).extend(ids)
         groups = [(key, sorted(set(ids))) for key, ids in group_map.items()]
         train_ids, val_ids, test_ids = _assign_groups(
             groups,
