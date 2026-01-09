@@ -221,6 +221,20 @@ def _choose_video_id_col(headers: List[str], video_id_col: Optional[str]) -> str
 
 def _collect_keyframes(keyframes_dir: str, video_id: str) -> List[str]:
     candidates: List[str] = []
+    parts = video_id.split("_")
+    if len(parts) >= 5 and parts[0] == "scenario" and parts[2] == "behavior":
+        scenario = f"{parts[0]}_{parts[1]}"
+        behavior = f"{parts[2]}_{parts[3]}"
+        clip = "_".join(parts[4:])
+        nested_dir = os.path.join(keyframes_dir, scenario, behavior, clip)
+        for candidate_dir in (nested_dir, os.path.join(nested_dir, "frames"), os.path.join(nested_dir, "keyframes")):
+            if not os.path.isdir(candidate_dir):
+                continue
+            for fname in sorted(os.listdir(candidate_dir)):
+                if fname.lower().endswith((".jpg", ".jpeg", ".png")):
+                    candidates.append(os.path.join(candidate_dir, fname))
+            if candidates:
+                return candidates
     subdir = os.path.join(keyframes_dir, video_id)
     if os.path.isdir(subdir):
         for fname in sorted(os.listdir(subdir)):
