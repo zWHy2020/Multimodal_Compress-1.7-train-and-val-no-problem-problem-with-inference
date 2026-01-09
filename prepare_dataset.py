@@ -265,10 +265,11 @@ def _dedupe_texts(texts: Iterable[str]) -> List[str]:
     return cleaned
 
 
-def _scan_chatscene_video_ids(video_dir: str) -> Dict[str, str]:
+def _scan_chatscene_video_ids(video_dir: str) -> Tuple[Dict[str, str], Dict[str, List[str]]]:
     if not os.path.isdir(video_dir):
-        return {}
+        return {}, {}
     video_ids: Dict[str, str] = {}
+    group_map: Dict[str, List[str]] = {}
     for root, dirs, files in os.walk(video_dir):
         dirs.sort()
         files.sort()
@@ -282,7 +283,9 @@ def _scan_chatscene_video_ids(video_dir: str) -> Dict[str, str]:
                 video_id = f"{group_id}_{stem}" if group_id else stem
                 rel_path = os.path.join(rel_dir, fname) if rel_dir else fname
                 video_ids[video_id] = rel_path
-    return video_ids
+                group_key = group_id or stem
+                group_map.setdefault(group_key, []).append(video_id)
+    return video_ids, group_map
 
 
 def build_chatscene_manifests(
@@ -305,20 +308,34 @@ def build_chatscene_manifests(
     val_ids = _read_split_file(os.path.join(splits_dir, "val.txt"))
     test_ids = _read_split_file(os.path.join(splits_dir, "test.txt"))
 
+    video_id_map, group_map = _scan_chatscene_video_ids(video_dir)
     with open(csv_path, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         headers = reader.fieldnames or []
         video_col = _choose_video_id_col(headers, video_id_col)
         text_column = _choose_text_col(headers, text_col)
         text_by_video: Dict[str, List[str]] = collections.defaultdict(list)
+        unmatched_ids = set()
         for row in reader:
             vid = str(row.get(video_col, "")).strip()
             if not vid:
                 continue
-            text_by_video[vid].append(row.get(text_column, ""))
+            text = row.get(text_column, "")
+            if vid in video_id_map:
+                text_by_video[vid].append(text)
+            elif vid in group_map:
+                for child_id in group_map[vid]:
+                    text_by_video[child_id].append(text)
+            else:
+                unmatched_ids.add(vid)
+    if unmatched_ids:
+        logger.warning(
+            "CSV 中有 %d 个 video_id 未匹配到视频或分组（示例: %s）",
+            len(unmatched_ids),
+            ", ".join(sorted(unmatched_ids)[:5]),
+        )
 
     rng = random.Random(seed)
-    video_id_map = _scan_chatscene_video_ids(video_dir)
     stats = {
         "missing_video": 0,
         "missing_keyframes": 0,
