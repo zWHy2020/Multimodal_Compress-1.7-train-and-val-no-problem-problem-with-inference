@@ -251,6 +251,26 @@ def _dedupe_texts(texts: Iterable[str]) -> List[str]:
     return cleaned
 
 
+def _scan_chatscene_video_ids(video_dir: str) -> Dict[str, str]:
+    if not os.path.isdir(video_dir):
+        return {}
+    video_ids: Dict[str, str] = {}
+    for root, dirs, files in os.walk(video_dir):
+        dirs.sort()
+        files.sort()
+        rel_dir = os.path.relpath(root, video_dir)
+        rel_dir = "" if rel_dir == "." else rel_dir
+        group_id = rel_dir.replace(os.sep, "_") if rel_dir else ""
+        for fname in files:
+            lower = fname.lower()
+            if lower.endswith(".mp4") or lower.endswith(".avi"):
+                stem = os.path.splitext(fname)[0]
+                video_id = f"{group_id}_{stem}" if group_id else stem
+                rel_path = os.path.join(rel_dir, fname) if rel_dir else fname
+                video_ids[video_id] = rel_path
+    return video_ids
+
+
 def build_chatscene_manifests(
     data_dir: str,
     video_dir: str,
@@ -284,6 +304,7 @@ def build_chatscene_manifests(
             text_by_video[vid].append(row.get(text_column, ""))
 
     rng = random.Random(seed)
+    video_id_map = _scan_chatscene_video_ids(video_dir)
     stats = {
         "missing_video": 0,
         "missing_keyframes": 0,
@@ -298,7 +319,11 @@ def build_chatscene_manifests(
         for vid in video_ids:
             if max_samples and stats["total_samples"] >= max_samples:
                 break
-            video_path = os.path.join(video_dir, f"{vid}.mp4")
+            video_rel_path = video_id_map.get(vid)
+            if video_rel_path:
+                video_path = os.path.join(video_dir, video_rel_path)
+            else:
+                video_path = os.path.join(video_dir, f"{vid}.mp4")
             if not os.path.exists(video_path):
                 stats["missing_video"] += 1
                 if strict:
