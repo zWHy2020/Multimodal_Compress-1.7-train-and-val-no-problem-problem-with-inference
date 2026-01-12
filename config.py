@@ -95,8 +95,8 @@ class TrainingConfig:
         
         self.video_hidden_dim = 384
         self.video_num_frames = 5
-        self.video_use_optical_flow = False  # 重构：默认禁用光流以节省显存，使用轻量级替代
-        self.video_use_convlstm = False  # 重构：默认禁用ConvLSTM以节省显存，使用轻量级时序卷积
+        self.video_use_optical_flow = True  # 默认启用光流用于时序对齐
+        self.video_use_convlstm = True  # 默认启用ConvLSTM建模时序
         self.video_output_dim = 256
         
         self.channel_type = "awgn"
@@ -198,9 +198,10 @@ class EvaluationConfig:
         
         self.video_hidden_dim = 256
         self.video_num_frames = 3
-        self.video_use_optical_flow = False  # 重构：默认禁用光流以节省显存
-        self.video_use_convlstm = False  # 重构：默认禁用ConvLSTM以节省显存
+        self.video_use_optical_flow = True  # 推理侧默认启用光流
+        self.video_use_convlstm = True  # 推理侧默认启用ConvLSTM
         self.video_output_dim = 256
+        self.use_amp = False  # 推理是否启用混合精度
         
         self.channel_type = "awgn"
         self.snr_db = 10.0
