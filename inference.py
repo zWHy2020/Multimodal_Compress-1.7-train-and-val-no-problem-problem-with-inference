@@ -21,7 +21,7 @@ from multimodal_jscc import MultimodalJSCC
 from config import EvaluationConfig
 from utils import (
     seed_torch, logger_configuration, makedirs,
-    split_image_v2, merge_image_v2, split_video_v2, merge_video_v2
+    split_image_v2, merge_image_v2
 )
 from torchvision import transforms
 from utils_check import print_model_structure_info, check_state_dict_compatibility
@@ -217,6 +217,57 @@ def register_branch_hooks(model: MultimodalJSCC) -> Tuple[Dict[str, int], List[A
     if hasattr(model, "video_decoder"):
         handles.append(model.video_decoder.register_forward_hook(make_hook("video_decoder")))
     return counters, handles
+
+
+def pad_video_patch(patch: torch.Tensor, patch_size: int) -> torch.Tensor:
+    h, w = patch.shape[-2], patch.shape[-1]
+    pad_h = patch_size - h
+    pad_w = patch_size - w
+    if pad_h > 0:
+        if pad_h < h:
+            patch = F.pad(patch, (0, 0, 0, pad_h), mode="reflect")
+        else:
+            patch = F.pad(patch, (0, 0, 0, pad_h), mode="replicate")
+    if pad_w > 0:
+        current_w = patch.shape[-1]
+        if pad_w < current_w:
+            patch = F.pad(patch, (0, pad_w, 0, 0), mode="reflect")
+        else:
+            patch = F.pad(patch, (0, pad_w, 0, 0), mode="replicate")
+    return patch
+
+
+def split_video_clip_patches(
+    video: torch.Tensor,
+    patch_size: int,
+    overlap: int,
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    first_frame = video[0]
+    _, meta = split_image_v2(first_frame, patch_size, overlap)
+    patches = []
+    for pos in meta["positions"]:
+        y, x = pos["y"], pos["x"]
+        y_end, x_end = pos["y_end"], pos["x_end"]
+        patch = video[:, :, y:y_end, x:x_end]
+        patch = pad_video_patch(patch, patch_size)
+        patches.append(patch)
+    patches_tensor = torch.stack(patches, dim=0)
+    return patches_tensor, meta
+
+
+def merge_video_clip_patches(
+    patches: torch.Tensor,
+    meta: Dict[str, Any],
+) -> torch.Tensor:
+    frame_count = patches.shape[1]
+    reconstructed_frames = []
+    for t in range(frame_count):
+        frame_patches = patches[:, t]
+        frame = merge_image_v2(frame_patches, meta)
+        if frame.dim() == 4:
+            frame = frame.squeeze(0)
+        reconstructed_frames.append(frame)
+    return torch.stack(reconstructed_frames, dim=0)
  
     #image_tensor = torch.clamp(image_tensor, 0, 1)
     
@@ -595,6 +646,7 @@ def infer_video(
     path_used = "standard"
 
     model.eval()
+    use_amp = getattr(config, "use_amp", False) and device.type == "cuda"
     with torch.no_grad():
         # 检查是否需要patch推理
         expected_h, expected_w = (224, 224)  # 默认值
@@ -607,97 +659,36 @@ def infer_video(
         padded_video, pad_h, pad_w = pad_image(video, pad_multiple)
         need_patch = (original_shape[2] != expected_h or original_shape[3] != expected_w)
         if need_patch and config.use_patch_inference:
-            path_used = "patch-based"
-            logger.info(f"使用 patch-based 推理...")
-            patches_list, meta_list = split_video_v2(padded_video, expected_h, config.patch_overlap)
-            logger.info(f"使用 patch-based 推理（patch_size={expected_h}, overlap={config.patch_overlap}）")
-            # 收集所有帧的所有patches
-            all_patches = []
-            frame_start_indices = [0]
-            current_idx = 0
-            
-            for t, frame_patches in enumerate(patches_list):
-                all_patches.append(frame_patches)
-                current_idx += len(frame_patches)
-                frame_start_indices.append(current_idx)
-            
-            # 批量处理所有patches
-            all_patches_tensor = torch.cat(all_patches, dim=0).to(device)
-            logger.info(f"视频分割为 {len(all_patches_tensor)} 个 patches（来自 {original_shape[0]} 帧）")
-            
-            # 【修复】使用分阶段处理：编码 -> 信道 -> 解码（传入语义上下文）
+            path_used = "clip-patch-video"
+            logger.info("使用 clip-level patch 视频推理（保持时间维度）")
+            patches, meta = split_video_clip_patches(padded_video, expected_h, config.patch_overlap)
+            logger.info(
+                "视频分割为 %d 个 clip patches（每个patch包含 %d 帧）",
+                patches.shape[0],
+                patches.shape[1],
+            )
             patch_results_list = []
-            patch_batch_size = 4  # 减小batch size以减少内存占用
-            
-            for i in range(0, len(all_patches_tensor), patch_batch_size):
-                patch_batch = all_patches_tensor[i:i+patch_batch_size]
-                
-                # 阶段1：编码
-                patch_encoded = model.encode(image_input=patch_batch, snr_db=config.snr_db)
-                patch_encoded_features = patch_encoded['image_encoded']
-                patch_guide_vectors = patch_encoded['image_guide']
-                
-                # 阶段2：功率归一化
-                #if 'image' in model.power_normalizer:
-                    #patch_encoded_features = model.power_normalizer['image'](patch_encoded_features)
-                
-                # 阶段3：信道传输
-                patch_transmitted = model.channel(patch_encoded_features)
-                
-                # 阶段4：解码（传入语义上下文以启用语义引导）
-                # 【优化】直接调用image_decoder以支持多条语义上下文
-                #patch_decoded_image = model.image_decoder(
-                    #patch_transmitted,
-                    #patch_guide_vectors,
-                    #semantic_context=semantic_context,
-                    #multiple_semantic_contexts=multiple_semantic_contexts,
-                    #snr_db=config.snr_db
-                #)
-                transmitted_dict = {'image': patch_transmitted}
-                guide_dict = {'image': patch_guide_vectors}
-                decoded_results = model.decode(
-                    transmitted_features=transmitted_dict,
-                    guide_vectors=guide_dict,
-                    semantic_context=semantic_context,
-                    multiple_semantic_contexts=multiple_semantic_contexts,
-                    snr_db=config.snr_db
-                )
-                patch_decoded_image = decoded_results['image_decoded']
-                # 立即移动到CPU以释放GPU内存
-                patch_results_list.append(patch_decoded_image.cpu())
-                
-                # 清理中间变量
-                del patch_encoded, patch_encoded_features, patch_guide_vectors
-                del patch_transmitted, patch_decoded_image, patch_batch
-                # 每处理几个batch后清理GPU缓存
+            patch_batch_size = 2
+            for i in range(0, len(patches), patch_batch_size):
+                patch_batch = patches[i:i + patch_batch_size].to(device)
+                with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+                    results = model(video_input=patch_batch, snr_db=config.snr_db)
+                patch_decoded_video = results["video_decoded"]
+                patch_results_list.append(patch_decoded_video.cpu())
+                del patch_batch, results, patch_decoded_video
                 if (i // patch_batch_size + 1) % 5 == 0:
                     torch.cuda.empty_cache()
-            
-            # 合并所有patch结果（数据已在CPU上）
-            all_reconstructed_patches = torch.cat(patch_results_list, dim=0)
-            
-            # 按帧重组patches
-            reconstructed_patches_by_frame = []
-            for t in range(original_shape[0]):
-                start_idx = frame_start_indices[t]
-                end_idx = frame_start_indices[t + 1]
-                frame_patches = all_reconstructed_patches[start_idx:end_idx]
-                reconstructed_patches_by_frame.append(frame_patches)
-            
-            # 清理中间变量
-            del patch_results_list, all_reconstructed_patches, all_patches_tensor
+            reconstructed_patches = torch.cat(patch_results_list, dim=0)
+            del patch_results_list, patches
             torch.cuda.empty_cache()
-            
-            # 逐帧合并，重建视频
-            reconstructed_video = merge_video_v2(reconstructed_patches_by_frame, meta_list)
+            reconstructed_video = merge_video_clip_patches(reconstructed_patches, meta)
             reconstructed_video = crop_image(reconstructed_video, pad_h, pad_w)
-            
-
         else:
             path_used = "standard"
             logger.info("使用标准推理")
             video_input = padded_video.unsqueeze(0).to(device)
-            results = model(video_input=video_input, snr_db=config.snr_db)
+            with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+                results = model(video_input=video_input, snr_db=config.snr_db)
             reconstructed_video = results['video_decoded']
             if reconstructed_video.dim() == 5:
                 reconstructed_video = reconstructed_video.squeeze(0)
@@ -713,12 +704,8 @@ def infer_video(
             branch_counters.get("image_decoder", 0),
             branch_counters.get("video_decoder", 0),
         )
-        if path_used == "patch-based":
-            logger.warning("[BranchDiagnose] 推理路径: patch-based (split_video_v2 / merge_video_v2)")
-            logger.warning(
-                "[BranchDiagnose] 当前 patch-based 路径逐帧调用 image 编解码，视频分支未参与。"
-                "如需确保视频分支参与，请使用 --no-patch 或实现 clip-level patch 视频推理。"
-            )
+        if path_used == "clip-patch-video":
+            logger.info("[BranchDiagnose] 推理路径: clip-level patch video (model(video_input=patches))")
         else:
             logger.info("[BranchDiagnose] 推理路径: standard (model(video_input=...))")
 

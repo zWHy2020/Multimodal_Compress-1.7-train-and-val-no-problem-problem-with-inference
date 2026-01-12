@@ -125,6 +125,66 @@ class LightweightTemporalConv(nn.Module):
         return x, x
 
 
+class ConvLSTMCell(nn.Module):
+    """ConvLSTM 单元"""
+
+    def __init__(self, input_dim: int, hidden_dim: int, kernel_size: int = 3, bias: bool = True):
+        super().__init__()
+        padding = kernel_size // 2
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.conv = nn.Conv2d(
+            input_dim + hidden_dim,
+            4 * hidden_dim,
+            kernel_size=kernel_size,
+            padding=padding,
+            bias=bias,
+        )
+
+    def forward(
+        self,
+        input_tensor: torch.Tensor,
+        state: Tuple[torch.Tensor, torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        h_cur, c_cur = state
+        combined = torch.cat([input_tensor, h_cur], dim=1)
+        conv_output = self.conv(combined)
+        cc_i, cc_f, cc_o, cc_g = torch.chunk(conv_output, 4, dim=1)
+        i = torch.sigmoid(cc_i)
+        f = torch.sigmoid(cc_f)
+        o = torch.sigmoid(cc_o)
+        g = torch.tanh(cc_g)
+        c_next = f * c_cur + i * g
+        h_next = o * torch.tanh(c_next)
+        return h_next, c_next
+
+
+class ConvLSTM(nn.Module):
+    """单层 ConvLSTM"""
+
+    def __init__(self, input_dim: int, hidden_dim: int, kernel_size: int = 3, bias: bool = True):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.cell = ConvLSTMCell(input_dim, hidden_dim, kernel_size, bias)
+
+    def forward(
+        self,
+        input_tensor: torch.Tensor,
+        state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if input_tensor.dim() != 4:
+            raise ValueError(
+                f"ConvLSTM expects [B, C, H, W] input, got {tuple(input_tensor.shape)}"
+            )
+        batch_size, _, height, width = input_tensor.shape
+        if state is None:
+            h = torch.zeros(batch_size, self.hidden_dim, height, width, device=input_tensor.device)
+            c = torch.zeros(batch_size, self.hidden_dim, height, width, device=input_tensor.device)
+            state = (h, c)
+        h_next, c_next = self.cell(input_tensor, state)
+        return h_next, (h_next, c_next)
+
+
 
 
 
@@ -416,15 +476,14 @@ class VideoJSCCEncoder(nn.Module):
         self.feature_reshape = nn.Conv2d(hidden_dim, hidden_dim, kernel_size=1)
         self.snr_modulator = SNRModulator(hidden_dim)
         
-        # 轻量级时序卷积建模（重构：使用LightweightTemporalConv替代ConvLSTM）
+        # ConvLSTM 时序建模
         if use_convlstm:
-            self.temporal_layer = LightweightTemporalConv(  # 实际上是LightweightTemporalConv
+            self.temporal_layer = ConvLSTM(
                 input_dim=hidden_dim,
                 hidden_dim=hidden_dim,
                 kernel_size=3,
-                num_layers=1  # 重构：减少层数以节省显存
             )
-            self.hidden_state = None  # 重构：hidden_state现在是单个tensor而不是list
+            self.hidden_state = None
         
         # 输出投影
         self.output_proj = nn.Sequential(
@@ -497,9 +556,8 @@ class VideoJSCCEncoder(nn.Module):
                 # 计算特征残差
                 feature_residual = current_feature - warped_feature
                 
-                # 轻量级时序卷积传播特征（重构：使用LightweightTemporalConv替代ConvLSTM）
+                # ConvLSTM 时序建模
                 if self.use_convlstm:
-                    # 新的LightweightTemporalConv接受[B, C, H, W]格式，不需要unsqueeze
                     feature_residual, self.hidden_state = self.temporal_layer(
                         feature_residual, self.hidden_state
                     )
@@ -518,7 +576,6 @@ class VideoJSCCEncoder(nn.Module):
             else:
                 # 第一帧或没有光流
                 if self.use_convlstm:
-                    # 新的LightweightTemporalConv接受[B, C, H, W]格式
                     current_feature, self.hidden_state = self.temporal_layer(
                         current_feature, self.hidden_state
                     )
@@ -741,15 +798,14 @@ class VideoJSCCDecoder(nn.Module):
             nn.Sigmoid()  # 添加 Sigmoid 激活函数，确保输出在 [0, 1] 范围内
         )
         
-        # 轻量级时序卷积建模（重构：使用LightweightTemporalConv替代ConvLSTM）
+        # ConvLSTM 时序建模
         if use_convlstm:
-            self.temporal_layer = LightweightTemporalConv(  # 实际上是LightweightTemporalConv
+            self.temporal_layer = ConvLSTM(
                 input_dim=hidden_dim,
                 hidden_dim=hidden_dim,
                 kernel_size=3,
-                num_layers=1  # 重构：减少层数以节省显存
             )
-            self.hidden_state = None  # 重构：hidden_state现在是单个tensor而不是list
+            self.hidden_state = None
         
         # 光流估计（用于解码端）
         if use_optical_flow:
@@ -844,10 +900,9 @@ class VideoJSCCDecoder(nn.Module):
                 projected_features = projected_features + guide_expanded
             del guide_expanded  # 及时释放
             
-            # 轻量级时序卷积建模（重构：使用LightweightTemporalConv替代ConvLSTM）
+            # ConvLSTM 时序建模
             # 注意：语义引导已在convlstm之前应用，确保所有时序和语义信息在进入convlstm之前都已就位
             if self.use_convlstm:
-                # 新的LightweightTemporalConv接受[B, C, H, W]格式
                 projected_features, self.hidden_state = self.temporal_layer(
                     projected_features, self.hidden_state
                 )
