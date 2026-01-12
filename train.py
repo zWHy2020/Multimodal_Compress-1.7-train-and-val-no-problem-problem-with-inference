@@ -83,7 +83,7 @@ def create_model(config: TrainingConfig) -> MultimodalJSCC:
         use_quantization_noise=getattr(config, 'use_quantization_noise', False),
         quantization_noise_range=getattr(config, 'quantization_noise_range', 0.5),
         use_text_guidance_image=getattr(config, "use_text_guidance_image", False),
-        use_text_guidance_video=getattr(config, "use_text_guidance_video", True),
+        use_text_guidance_video=getattr(config, "use_text_guidance_video", False),
         enforce_text_condition=getattr(config, "enforce_text_condition", True),
         condition_margin_weight=getattr(config, "condition_margin_weight", 0.0),
         condition_margin=getattr(config, "condition_margin", 0.05),
@@ -766,6 +766,8 @@ def main():
     parser.add_argument('--train-snr-random', action='store_true', help='训练时启用随机SNR')
     parser.add_argument('--train-snr-min', type=float, default=None, help='训练随机SNR最小值')
     parser.add_argument('--train-snr-max', type=float, default=None, help='训练随机SNR最大值')
+    parser.add_argument('--use-text-guidance-image', action='store_true', help='启用文本语义引导图像重建')
+    parser.add_argument('--use-text-guidance-video', action='store_true', help='启用文本语义引导视频重建')
     parser.add_argument(
         '--video-sampling-strategy',
         type=str,
@@ -841,6 +843,10 @@ def main():
         config.train_snr_min = args.train_snr_min
     if args.train_snr_max is not None:
         config.train_snr_max = args.train_snr_max
+    if args.use_text_guidance_image:
+        config.use_text_guidance_image = True
+    if args.use_text_guidance_video:
+        config.use_text_guidance_video = True
     
     # 配置日志
     if is_main_process:

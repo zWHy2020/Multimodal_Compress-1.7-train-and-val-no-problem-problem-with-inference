@@ -63,7 +63,7 @@ class TrainingConfig:
         self.temporal_consistency_weight = 0.02  # 【新增】视频时序一致性正则权重
         # 文本引导与条件约束（路线1默认）
         self.use_text_guidance_image = False
-        self.use_text_guidance_video = True
+        self.use_text_guidance_video = False
         self.enforce_text_condition = True
         self.condition_margin_weight = 0.1
         self.condition_margin = 0.05
@@ -247,7 +247,7 @@ class EvaluationConfig:
         self.channel_type = "awgn"
         # 文本引导与条件约束（评估侧保持与训练一致的开关）
         self.use_text_guidance_image = False
-        self.use_text_guidance_video = True
+        self.use_text_guidance_video = False
         self.enforce_text_condition = True
         self.condition_prob = 0.0  # 评估默认不触发额外 condition-margin 计算
         self.condition_margin = 0.05

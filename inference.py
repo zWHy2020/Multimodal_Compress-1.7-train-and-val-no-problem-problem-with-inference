@@ -962,6 +962,8 @@ def load_model(model_path: str, config: EvaluationConfig, device: torch.device, 
         if getattr(config, "pretrained_model_name", None):
             model_config["pretrained_model_name"] = config.pretrained_model_name
     model_config["snr_db"] = config.snr_db
+    model_config["use_text_guidance_image"] = getattr(config, "use_text_guidance_image", False)
+    model_config["use_text_guidance_video"] = getattr(config, "use_text_guidance_video", False)
     try:
          model = MultimodalJSCC(**model_config)
     except TypeError as e:
@@ -1110,6 +1112,8 @@ def main():
     )
     parser.add_argument('--save_video_frames', action='store_true', help='保存视频帧序列')
     parser.add_argument('--diagnose_branches', action='store_true', help='诊断视频分支调用情况')
+    parser.add_argument('--use-text-guidance-image', action='store_true', help='启用文本语义引导图像重建')
+    parser.add_argument('--use-text-guidance-video', action='store_true', help='启用文本语义引导视频重建')
     parser.add_argument('--text-input', type=str, default=None, 
                        help='文本输入路径（用于语义引导图像/视频解码）')
     parser.add_argument('--prompt', type=str, default=None,
@@ -1142,6 +1146,10 @@ def main():
     config.infer_window_len = args.infer_window_len
     config.infer_window_stride = args.infer_window_stride
     config.max_output_frames = args.max_output_frames
+    if args.use_text_guidance_image:
+        config.use_text_guidance_image = True
+    if args.use_text_guidance_video:
+        config.use_text_guidance_video = True
     if args.video_sampling_strategy:
         config.video_sampling_strategy = args.video_sampling_strategy
     if config.snr_random:
