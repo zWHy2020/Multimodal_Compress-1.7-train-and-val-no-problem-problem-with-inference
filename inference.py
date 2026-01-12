@@ -90,13 +90,13 @@ def load_text(text_path: str) -> str:
         return f.read().strip()
 
 
-def load_video(video_path: str, max_frames: int = 10, normalize: bool = False) -> torch.Tensor:
+def load_video(video_path: str, max_frames: Optional[int] = None, normalize: bool = False) -> torch.Tensor:
     """
     加载视频并转换为tensor
     
     Args:
         video_path: 视频文件路径
-        max_frames: 最大帧数
+        max_frames: 最大帧数，None 表示读取全帧
         normalize: 是否使用ImageNet归一化
     
     Returns:
@@ -117,7 +117,7 @@ def load_video(video_path: str, max_frames: int = 10, normalize: bool = False) -
     cap.release()
     
     # 限制帧数
-    if len(frames) > max_frames:
+    if max_frames is not None and len(frames) > max_frames:
         indices = np.linspace(0, len(frames) - 1, max_frames, dtype=int)
         frames = [frames[i] for i in indices]
     
@@ -192,6 +192,116 @@ def get_video_meta(video_path: str) -> Dict[str, float]:
         "frame_count": frame_count,
         "duration": duration,
     }
+
+
+def resolve_infer_window(config: EvaluationConfig) -> Tuple[int, int]:
+    window_len = (
+        config.infer_window_len
+        if getattr(config, "infer_window_len", None)
+        else getattr(config, "video_clip_len", None)
+    )
+    if not window_len:
+        window_len = getattr(config, "max_video_frames", 10)
+    stride = (
+        config.infer_window_stride
+        if getattr(config, "infer_window_stride", None)
+        else getattr(config, "video_stride", None)
+    )
+    if not stride:
+        stride = window_len
+    if window_len <= 0 or stride <= 0:
+        raise ValueError(f"无效滑窗参数: window_len={window_len}, stride={stride}")
+    return window_len, stride
+
+
+def reconstruct_video_clip(
+    model: MultimodalJSCC,
+    video_clip: torch.Tensor,
+    config: EvaluationConfig,
+    device: torch.device,
+    logger: logging.Logger,
+    use_amp: bool,
+) -> Tuple[torch.Tensor, str]:
+    original_shape = video_clip.shape
+    expected_h, expected_w = (224, 224)
+    if hasattr(model, "image_encoder") and hasattr(model.image_encoder, "patch_embed"):
+        if hasattr(model.image_encoder.patch_embed, "img_size"):
+            expected_h, expected_w = model.image_encoder.patch_embed.img_size
+    pad_multiple = expected_h
+    padded_video, pad_h, pad_w = pad_image(video_clip, pad_multiple)
+    need_patch = (original_shape[2] != expected_h or original_shape[3] != expected_w)
+    if need_patch and config.use_patch_inference:
+        path_used = "clip-patch-video"
+        patches, meta = split_video_clip_patches(padded_video, expected_h, config.patch_overlap)
+        patch_results_list = []
+        patch_batch_size = 2
+        for i in range(0, len(patches), patch_batch_size):
+            patch_batch = patches[i : i + patch_batch_size].to(device)
+            with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+                results = model(video_input=patch_batch, snr_db=config.snr_db)
+            patch_decoded_video = results["video_decoded"]
+            patch_results_list.append(patch_decoded_video.cpu())
+            del patch_batch, results, patch_decoded_video
+            if (i // patch_batch_size + 1) % 5 == 0:
+                torch.cuda.empty_cache()
+        reconstructed_patches = torch.cat(patch_results_list, dim=0)
+        del patch_results_list, patches
+        torch.cuda.empty_cache()
+        reconstructed_video = merge_video_clip_patches(reconstructed_patches, meta)
+        reconstructed_video = crop_image(reconstructed_video, pad_h, pad_w)
+    else:
+        path_used = "standard"
+        video_input = padded_video.unsqueeze(0).to(device)
+        with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+            results = model(video_input=video_input, snr_db=config.snr_db)
+        reconstructed_video = results["video_decoded"]
+        if reconstructed_video.dim() == 5:
+            reconstructed_video = reconstructed_video.squeeze(0)
+        reconstructed_video = crop_image(reconstructed_video, pad_h, pad_w)
+    if reconstructed_video.shape != original_shape:
+        logger.warning(
+            "重建视频尺寸不一致: original=%s reconstructed=%s",
+            original_shape,
+            reconstructed_video.shape,
+        )
+    return reconstructed_video, path_used
+
+
+def sliding_window_reconstruct(
+    model: MultimodalJSCC,
+    video_full: torch.Tensor,
+    config: EvaluationConfig,
+    device: torch.device,
+    logger: logging.Logger,
+    use_amp: bool,
+    window_len: int,
+    stride: int,
+) -> Tuple[torch.Tensor, str]:
+    total_frames = video_full.shape[0]
+    accum = torch.zeros_like(video_full, dtype=torch.float32, device=device)
+    counts = torch.zeros((total_frames, 1, 1, 1), dtype=torch.float32, device=device)
+    path_used = "sliding-window"
+    for start in range(0, total_frames, stride):
+        end = min(start + window_len, total_frames)
+        window = video_full[start:end]
+        valid_len = window.shape[0]
+        if valid_len < window_len:
+            pad_frames = window[-1:].repeat(window_len - valid_len, 1, 1, 1)
+            window = torch.cat([window, pad_frames], dim=0)
+        reconstructed_window, path_used = reconstruct_video_clip(
+            model=model,
+            video_clip=window,
+            config=config,
+            device=device,
+            logger=logger,
+            use_amp=use_amp,
+        )
+        reconstructed_window = reconstructed_window[:valid_len].to(device)
+        accum[start:end] += reconstructed_window
+        counts[start:end] += 1.0
+    counts = torch.clamp(counts, min=1.0)
+    final_video = accum / counts
+    return final_video, path_used
 
 
 def register_branch_hooks(model: MultimodalJSCC) -> Tuple[Dict[str, int], List[Any]]:
@@ -582,7 +692,7 @@ def infer_video(
         Dict[str, Any]: 推理结果
     """
     logger.info(f"加载视频: {video_path}")
-    video = load_video(video_path, max_frames=config.max_video_frames, normalize=normalize)  # [T, C, H, W]
+    video = load_video(video_path, max_frames=None, normalize=normalize)  # [T, C, H, W]
     fps = get_video_fps(video_path, default_fps)
     original_shape = video.shape
     
@@ -647,52 +757,32 @@ def infer_video(
 
     model.eval()
     use_amp = getattr(config, "use_amp", False) and device.type == "cuda"
+    window_len, stride = resolve_infer_window(config)
+    logger.info(
+        "滑窗推理设置: window_len=%d stride=%d (sampling_strategy=%s)",
+        window_len,
+        stride,
+        getattr(config, "video_sampling_strategy", "unknown"),
+    )
     with torch.no_grad():
-        # 检查是否需要patch推理
-        expected_h, expected_w = (224, 224)  # 默认值
-        if hasattr(model, 'image_encoder') and hasattr(model.image_encoder, 'patch_embed'):
-            if hasattr(model.image_encoder.patch_embed, 'img_size'):
-                expected_h, expected_w = model.image_encoder.patch_embed.img_size
-            # 尝试获取期望的帧尺寸
-            pass  # 视频编码器可能没有固定的图像尺寸要求
-        pad_multiple = expected_h  # 或者 64
-        padded_video, pad_h, pad_w = pad_image(video, pad_multiple)
-        need_patch = (original_shape[2] != expected_h or original_shape[3] != expected_w)
-        if need_patch and config.use_patch_inference:
-            path_used = "clip-patch-video"
-            logger.info("使用 clip-level patch 视频推理（保持时间维度）")
-            patches, meta = split_video_clip_patches(padded_video, expected_h, config.patch_overlap)
-            logger.info(
-                "视频分割为 %d 个 clip patches（每个patch包含 %d 帧）",
-                patches.shape[0],
-                patches.shape[1],
-            )
-            patch_results_list = []
-            patch_batch_size = 2
-            for i in range(0, len(patches), patch_batch_size):
-                patch_batch = patches[i:i + patch_batch_size].to(device)
-                with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-                    results = model(video_input=patch_batch, snr_db=config.snr_db)
-                patch_decoded_video = results["video_decoded"]
-                patch_results_list.append(patch_decoded_video.cpu())
-                del patch_batch, results, patch_decoded_video
-                if (i // patch_batch_size + 1) % 5 == 0:
-                    torch.cuda.empty_cache()
-            reconstructed_patches = torch.cat(patch_results_list, dim=0)
-            del patch_results_list, patches
-            torch.cuda.empty_cache()
-            reconstructed_video = merge_video_clip_patches(reconstructed_patches, meta)
-            reconstructed_video = crop_image(reconstructed_video, pad_h, pad_w)
-        else:
-            path_used = "standard"
-            logger.info("使用标准推理")
-            video_input = padded_video.unsqueeze(0).to(device)
-            with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-                results = model(video_input=video_input, snr_db=config.snr_db)
-            reconstructed_video = results['video_decoded']
-            if reconstructed_video.dim() == 5:
-                reconstructed_video = reconstructed_video.squeeze(0)
-            reconstructed_video = crop_image(reconstructed_video, pad_h, pad_w)
+        reconstructed_video, path_used = sliding_window_reconstruct(
+            model=model,
+            video_full=video,
+            config=config,
+            device=device,
+            logger=logger,
+            use_amp=use_amp,
+            window_len=window_len,
+            stride=stride,
+        )
+
+    reconstructed_video = reconstructed_video.cpu()
+    if getattr(config, "max_output_frames", None):
+        max_output_frames = config.max_output_frames
+        if max_output_frames > 0 and reconstructed_video.shape[0] > max_output_frames:
+            reconstructed_video = reconstructed_video[:max_output_frames]
+            video = video[:max_output_frames]
+            original_shape = video.shape
     
     if diagnose_branches:
         for handle in hook_handles:
@@ -832,6 +922,14 @@ def load_model(model_path: str, config: EvaluationConfig, device: torch.device, 
                 "⚠️ Checkpoint 中缺少 pretrained_model_name，可能导致主干结构不匹配。"
                 "请在推理时使用 --pretrained-model-name 指定训练时的模型名称。"
             )
+        config.video_clip_len = model_config.get("video_clip_len", config.video_clip_len)
+        config.video_stride = model_config.get("video_stride", config.video_stride)
+        config.video_sampling_strategy = model_config.get(
+            "video_sampling_strategy", config.video_sampling_strategy
+        )
+        config.video_eval_sampling_strategy = model_config.get(
+            "video_eval_sampling_strategy", config.video_eval_sampling_strategy
+        )
     else:
         logger.warning("⚠️ Checkpoint 中未找到配置信息！将使用 EvaluationConfig 的默认值（极高风险！）")
         model_config = {
@@ -985,6 +1083,16 @@ def main():
     parser.add_argument('--snr', type=float, default=10.0, help='信噪比 (dB)')
     parser.add_argument('--no-patch', action='store_true', help='禁用patch-based推理')
     parser.add_argument('--video_fps', type=float, default=10.0, help='视频保存帧率')
+    parser.add_argument('--infer-window-len', type=int, default=None, help='滑窗推理window长度')
+    parser.add_argument('--infer-window-stride', type=int, default=None, help='滑窗推理stride')
+    parser.add_argument('--max-output-frames', type=int, default=None, help='推理输出最大帧数（调试用）')
+    parser.add_argument(
+        '--video-sampling-strategy',
+        type=str,
+        default=None,
+        choices=["contiguous_clip", "uniform", "fixed_start"],
+        help='推理侧记录的采样策略（用于日志显示）',
+    )
     parser.add_argument('--normalize', action='store_true', help='使用ImageNet归一化（与旧模型兼容）')
     parser.add_argument(
         '--save_video_mp4',
@@ -1018,6 +1126,11 @@ def main():
     config.snr_db = args.snr
     config.use_patch_inference = not args.no_patch
     config.pretrained_model_name = args.pretrained_model_name
+    config.infer_window_len = args.infer_window_len
+    config.infer_window_stride = args.infer_window_stride
+    config.max_output_frames = args.max_output_frames
+    if args.video_sampling_strategy:
+        config.video_sampling_strategy = args.video_sampling_strategy
     
     # 推断模态类型
     if args.modality is None:
