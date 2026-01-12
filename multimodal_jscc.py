@@ -113,7 +113,7 @@ class MultimodalJSCC(nn.Module):
         use_quantization_noise: bool = False,
         quantization_noise_range: float = 0.5,
         use_text_guidance_image: bool = False,
-        use_text_guidance_video: bool = True,
+        use_text_guidance_video: bool = False,
         enforce_text_condition: bool = True,
         condition_margin_weight: float = 0.1,
         condition_margin: float = 0.05,
@@ -406,7 +406,7 @@ class MultimodalJSCC(nn.Module):
             video_decoded = self.video_decoder(
                 transmitted_features['video'],
                 guide_vectors['video'],
-                semantic_context=semantic_for_video  # 使用原始文本编码（未归一化）作为语义上下文
+                semantic_context=semantic_for_video  # None 时视频解码不会走语义 cross-attention
             )
             decoded_outputs['video'] = video_decoded
             results['video_decoded'] = video_decoded
@@ -568,7 +568,7 @@ class MultimodalJSCC(nn.Module):
             video_decoded = self.video_decoder(
                 transmitted_features['video'],
                 guide_vectors['video'],
-                semantic_context=semantic_for_video,  # 传递语义上下文
+                semantic_context=semantic_for_video,  # None 时视频解码不会走语义 cross-attention
                 multiple_semantic_contexts=multiple_semantic_contexts
             )
             results['video_decoded'] = video_decoded
