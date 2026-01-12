@@ -125,6 +125,7 @@ def _build_model(config: TrainingConfig, device: torch.device) -> MultimodalJSCC
 
 
 def _build_loss_fn(config: TrainingConfig, device: torch.device) -> MultimodalLoss:
+    gan_weight = getattr(config, "gan_weight", getattr(config, "discriminator_weight", 0.01))
     loss_fn = MultimodalLoss(
         text_weight=config.text_weight,
         image_weight=config.image_weight,
@@ -136,7 +137,7 @@ def _build_loss_fn(config: TrainingConfig, device: torch.device) -> MultimodalLo
         video_text_contrastive_weight=getattr(config, "video_text_contrastive_weight", 0.05),
         rate_weight=getattr(config, "rate_weight", 1e-4),
         temporal_consistency_weight=getattr(config, "temporal_consistency_weight", 0.02),
-        discriminator_weight=getattr(config, "discriminator_weight", 0.01),
+        gan_weight=gan_weight,
         use_adversarial=getattr(config, "use_adversarial", False),
         data_range=1.0,
     )

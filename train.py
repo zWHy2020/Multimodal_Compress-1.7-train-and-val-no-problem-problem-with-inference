@@ -96,6 +96,7 @@ def create_model(config: TrainingConfig) -> MultimodalJSCC:
 
 def create_loss_fn(config: TrainingConfig) -> MultimodalLoss:
     """创建损失函数"""
+    gan_weight = getattr(config, 'gan_weight', getattr(config, 'discriminator_weight', 0.01))
     loss_fn = MultimodalLoss(
         text_weight=config.text_weight,
         image_weight=config.image_weight,
@@ -107,7 +108,7 @@ def create_loss_fn(config: TrainingConfig) -> MultimodalLoss:
         video_text_contrastive_weight=getattr(config, 'video_text_contrastive_weight', 0.05),  # 【新增】视频-文本对比损失权重
         rate_weight=getattr(config, 'rate_weight', 1e-4),  # 【新增】码率/能量约束权重
         temporal_consistency_weight=getattr(config, 'temporal_consistency_weight', 0.02),  # 【新增】视频时序一致性正则权重
-        discriminator_weight=getattr(config, 'discriminator_weight', 0.01),  # 【Phase 3】对抗损失权重
+        gan_weight=gan_weight,  # 【Phase 6】对抗损失权重
         use_adversarial=getattr(config, 'use_adversarial', False),  # 【Phase 3】是否使用对抗训练
         condition_margin_weight=getattr(config, "condition_margin_weight", 0.0),
         condition_margin=getattr(config, "condition_margin", 0.05),
@@ -210,6 +211,18 @@ def _log_nonfinite_tensor(
     return True
 
 
+def _compute_r1_penalty(d_out: torch.Tensor, real_input: torch.Tensor) -> torch.Tensor:
+    grad = torch.autograd.grad(
+        outputs=d_out.sum(),
+        inputs=real_input,
+        create_graph=True,
+        retain_graph=True,
+        only_inputs=True,
+    )[0]
+    grad = grad.view(grad.shape[0], -1)
+    return grad.pow(2).sum(1).mean()
+
+
 def train_one_epoch(
     model: MultimodalJSCC,
     train_loader: DataLoader,
@@ -243,6 +256,9 @@ def train_one_epoch(
         'video_percep_loss': AverageMeter(),
         'video_temporal_loss': AverageMeter(),
         'condition_margin_loss': AverageMeter(),
+        'adversarial_loss': AverageMeter(),
+        'disc_loss_real': AverageMeter(),
+        'disc_loss_fake': AverageMeter(),
         'video_semantic_gate_mean': AverageMeter(),
         'time': AverageMeter()
     }
@@ -263,7 +279,12 @@ def train_one_epoch(
     #if optimizer_d is not None:
         #optimizer_d.zero_grad()
     adv_loss_fn = None
-    if discriminator is not None:
+    gan_enable_epoch = int(getattr(config, "gan_enable_epoch", 0))
+    d_updates_per_g = max(1, int(getattr(config, "d_updates_per_g", 1)))
+    use_r1 = bool(getattr(config, "use_r1_regularization", False))
+    r1_gamma = float(getattr(config, "r1_gamma", 10.0))
+    gan_active = bool(getattr(config, "use_adversarial", False)) and epoch >= gan_enable_epoch
+    if discriminator is not None and gan_active:
         from losses import AdversarialLoss
         adv_loss_fn = AdversarialLoss().to(device)
 
@@ -338,25 +359,24 @@ def train_one_epoch(
             
             # 【Phase 3】如果启用对抗训练，计算判别器输出
             discriminator_outputs = None
-            if discriminator is not None:
-                #with torch.no_grad():
-                    for p in discriminator.parameters(): p.requires_grad = False
+            if discriminator is not None and gan_active:
+                # 判别器在生成器训练时不需要梯度
+                for p in discriminator.parameters():
+                    p.requires_grad = False
 
-                    # 判别器在生成器训练时不需要梯度
-                    image_disc_pred = None
-                    video_disc_pred = None
-                    if 'image_decoded' in results:
-                        image_disc_pred, _ = discriminator(image=results['image_decoded'])
-                    if 'video_decoded' in results:
-                        _, video_disc_pred = discriminator(video=results['video_decoded'])
-                    discriminator_outputs = {}
-                    if image_disc_pred is not None: discriminator_outputs['image'] = image_disc_pred
-                    if video_disc_pred is not None: discriminator_outputs['video'] = video_disc_pred
-                    for p in discriminator.parameters(): p.requires_grad = True
-                    #if image_disc_pred is not None:
-                        #discriminator_outputs['image'] = image_disc_pred
-                    #if video_disc_pred is not None:
-                        #discriminator_outputs['video'] = video_disc_pred
+                image_disc_pred = None
+                video_disc_pred = None
+                if 'image_decoded' in results:
+                    image_disc_pred, _ = discriminator(image=results['image_decoded'])
+                if 'video_decoded' in results:
+                    _, video_disc_pred = discriminator(video=results['video_decoded'])
+                discriminator_outputs = {}
+                if image_disc_pred is not None:
+                    discriminator_outputs['image'] = image_disc_pred
+                if video_disc_pred is not None:
+                    discriminator_outputs['video'] = video_disc_pred
+                for p in discriminator.parameters():
+                    p.requires_grad = True
             
             # 条件边际约束：对同一传输特征使用打乱文本解码，强制文本条件有效
             condition_enabled = (
@@ -431,41 +451,9 @@ def train_one_epoch(
             scaler.scale(total_loss).backward()
         else:
             total_loss.backward()
-        if discriminator is not None and optimizer_d is not None:
-            disc_loss_real = torch.tensor(0.0, device=device)
-            disc_loss_fake = torch.tensor(0.0, device=device)
-            with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-                if 'image' in device_targets:
-                    real_img_pred, _ = discriminator(image=device_targets['image'])
-                    if adv_loss_fn is None:
-                        from losses import AdversarialLoss
-                        adv_loss_fn = AdversarialLoss().to(device)
-                    disc_loss_real = disc_loss_real + adv_loss_fn(real_img_pred, target_is_real=True)
-                if 'video' in device_targets:
-                    _, video_real_pred = discriminator(video=device_targets['video'])
-                    if adv_loss_fn is None:
-                        from losses import AdversarialLoss
-                        adv_loss_fn = AdversarialLoss().to(device)
-                    disc_loss_real = disc_loss_real + adv_loss_fn(video_real_pred, target_is_real=True)
-                if 'image_decoded' in results:
-                    image_fake_pred, _ = discriminator(image=results['image_decoded'].detach())
-                    if adv_loss_fn is None:
-                        from losses import AdversarialLoss
-                        adv_loss_fn = AdversarialLoss().to(device)
-                    disc_loss_fake = disc_loss_fake + adv_loss_fn(image_fake_pred, target_is_real=False)
-                if 'video_decoded' in results:
-                    _, video_fake_pred = discriminator(video=results['video_decoded'].detach())
-                    if adv_loss_fn is None:
-                        from losses import AdversarialLoss
-                        adv_loss_fn = AdversarialLoss().to(device)
-                    disc_loss_fake = disc_loss_fake + adv_loss_fn(video_fake_pred, target_is_real=False)
-                disc_loss = (disc_loss_real + disc_loss_fake) * 0.5
-                disc_loss = disc_loss / accumulation_steps
-            if scaler is not None:
-                scaler.scale(disc_loss).backward()
-            else:
-                disc_loss.backward()
-        
+        disc_loss_real_value = None
+        disc_loss_fake_value = None
+
         # 梯度累积：只在累积步数达到时更新参数
         if (batch_idx + 1) % accumulation_steps == 0:
             # 梯度裁剪（更严格的裁剪，防止梯度爆炸）
@@ -522,17 +510,58 @@ def train_one_epoch(
  
             
             # 【Phase 3】训练判别器（如果启用对抗训练）
-            if not skip_update_manual and discriminator is not None and optimizer_d is not None:
-                if config.grad_clip_norm > 0:
+            if (
+                not skip_update_manual
+                and discriminator is not None
+                and optimizer_d is not None
+                and gan_active
+            ):
+                for _ in range(d_updates_per_g):
+                    optimizer_d.zero_grad()
+                    disc_loss_real = torch.tensor(0.0, device=device)
+                    disc_loss_fake = torch.tensor(0.0, device=device)
+                    r1_penalty = torch.tensor(0.0, device=device)
+                    with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+                        if 'image' in device_targets:
+                            real_image = device_targets['image']
+                            if use_r1:
+                                real_image = real_image.requires_grad_(True)
+                            real_img_pred, _ = discriminator(image=real_image)
+                            disc_loss_real = disc_loss_real + adv_loss_fn(real_img_pred, target_is_real=True)
+                            if use_r1:
+                                r1_penalty = r1_penalty + _compute_r1_penalty(real_img_pred, real_image)
+                        if 'video' in device_targets:
+                            real_video = device_targets['video']
+                            if use_r1:
+                                real_video = real_video.requires_grad_(True)
+                            _, video_real_pred = discriminator(video=real_video)
+                            disc_loss_real = disc_loss_real + adv_loss_fn(video_real_pred, target_is_real=True)
+                            if use_r1:
+                                r1_penalty = r1_penalty + _compute_r1_penalty(video_real_pred, real_video)
+                        if 'image_decoded' in results:
+                            image_fake_pred, _ = discriminator(image=results['image_decoded'].detach())
+                            disc_loss_fake = disc_loss_fake + adv_loss_fn(image_fake_pred, target_is_real=False)
+                        if 'video_decoded' in results:
+                            _, video_fake_pred = discriminator(video=results['video_decoded'].detach())
+                            disc_loss_fake = disc_loss_fake + adv_loss_fn(video_fake_pred, target_is_real=False)
+                        disc_loss = (disc_loss_real + disc_loss_fake) * 0.5
+                        if use_r1:
+                            disc_loss = disc_loss + 0.5 * r1_gamma * r1_penalty
                     if scaler is not None:
-                        scaler.unscale_(optimizer_d)
-                    torch.nn.utils.clip_grad_norm_(discriminator.parameters(), config.grad_clip_norm)
-                if scaler is not None:
-                    scaler.step(optimizer_d)
-                else:
-                    optimizer_d.step()
-                optimizer_d.zero_grad()
-                
+                        scaler.scale(disc_loss).backward()
+                    else:
+                        disc_loss.backward()
+                    if config.grad_clip_norm > 0:
+                        if scaler is not None:
+                            scaler.unscale_(optimizer_d)
+                        torch.nn.utils.clip_grad_norm_(discriminator.parameters(), config.grad_clip_norm)
+                    if scaler is not None:
+                        scaler.step(optimizer_d)
+                    else:
+                        optimizer_d.step()
+                    disc_loss_real_value = disc_loss_real.item()
+                    disc_loss_fake_value = disc_loss_fake.item()
+
      
             if scaler is not None:
                 scaler.update()
@@ -566,6 +595,12 @@ def train_one_epoch(
             meters['video_temporal_loss'].update(loss_dict.get('video_temporal_loss_l1', 0.0))
         if 'condition_margin_loss' in loss_dict:
             meters['condition_margin_loss'].update(loss_dict.get('condition_margin_loss', 0.0))
+        if 'adversarial_loss' in loss_dict:
+            meters['adversarial_loss'].update(loss_dict.get('adversarial_loss', 0.0))
+        if disc_loss_real_value is not None:
+            meters['disc_loss_real'].update(disc_loss_real_value)
+        if disc_loss_fake_value is not None:
+            meters['disc_loss_fake'].update(disc_loss_fake_value)
         if results.get("video_semantic_gate_mean") is not None:
             meters['video_semantic_gate_mean'].update(results.get("video_semantic_gate_mean", 0.0))
         
@@ -592,6 +627,12 @@ def train_one_epoch(
                 log_msg += f' | ImageLoss {meters["image_loss"].avg:.4f}'
             if video_input is not None and meters['video_loss'].count > 0:
                 log_msg += f' | VideoLoss {meters["video_loss"].avg:.4f}'
+            if meters['adversarial_loss'].count > 0:
+                log_msg += f' | AdvLoss {meters["adversarial_loss"].avg:.4f}'
+            if meters['disc_loss_real'].count > 0:
+                log_msg += f' | DiscReal {meters["disc_loss_real"].avg:.4f}'
+            if meters['disc_loss_fake'].count > 0:
+                log_msg += f' | DiscFake {meters["disc_loss_fake"].avg:.4f}'
             
             logger.info(log_msg)
             
