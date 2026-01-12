@@ -76,6 +76,12 @@ class TrainingConfig:
         self.train_snr_max = 15.0
         self.train_snr_random = False # 是否随机SNR
         self.snr_db = 10.0
+
+        # 带宽/码率调度（通道门控）
+        self.bandwidth_ratio_start = 1.0
+        self.bandwidth_ratio_end = 1.0
+        self.bandwidth_warmup_epochs = 0
+        self.bandwidth_anneal_epochs = 0
         # 模型参数
         self.vocab_size = 65536
         self.text_embed_dim = 512

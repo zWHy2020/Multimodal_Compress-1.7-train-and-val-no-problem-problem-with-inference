@@ -18,6 +18,51 @@ from cross_attention import MultiModalCrossAttention
 from channel import Channel
 
 
+class BandwidthMask(nn.Module):
+    """基于带宽比例的通道门控（不改变张量形状）。"""
+
+    def __init__(self, ratio: float = 1.0):
+        super().__init__()
+        self.ratio = float(ratio)
+
+    def set_ratio(self, ratio: float) -> None:
+        self.ratio = float(ratio)
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        if features is None:
+            return features
+        ratio = float(self.ratio) if self.ratio is not None else 1.0
+        ratio = max(0.0, min(1.0, ratio))
+        if ratio >= 1.0:
+            return features
+
+        if features.dim() == 5:
+            channel_dim = 2  # [B, T, C, H, W]
+        elif features.dim() == 4:
+            channel_dim = 1  # [B, C, H, W]
+        elif features.dim() == 3:
+            channel_dim = 2  # [B, L, C]
+        else:
+            return features
+
+        channels = features.size(channel_dim)
+        if ratio <= 0.0 or channels == 0:
+            return torch.zeros_like(features)
+
+        kept = int(math.ceil(channels * ratio))
+        kept = max(1, min(channels, kept))
+        mask = torch.zeros(channels, device=features.device, dtype=features.dtype)
+        mask[:kept] = 1.0
+
+        if features.dim() == 5:
+            mask = mask.view(1, 1, channels, 1, 1)
+        elif features.dim() == 4:
+            mask = mask.view(1, channels, 1, 1)
+        else:
+            mask = mask.view(1, 1, channels)
+        return features * mask
+
+
 class MultimodalJSCC(nn.Module):
     """
     多模态联合信源信道编码模型
@@ -165,6 +210,8 @@ class MultimodalJSCC(nn.Module):
         self.condition_prob = condition_prob
         self.condition_only_low_snr = condition_only_low_snr
         self.condition_low_snr_threshold = condition_low_snr_threshold
+        self.bandwidth_ratio = 1.0
+        self.bandwidth_mask = BandwidthMask(self.bandwidth_ratio)
         
         # 功率归一化模块（可选）
         # 始终创建属性以便在评估/推理阶段安全访问
@@ -273,6 +320,7 @@ class MultimodalJSCC(nn.Module):
         # 视频编码
         if video_input is not None:
             video_encoded, video_guide = self.video_encoder(video_input, snr_db=snr_db)
+            video_encoded = self.bandwidth_mask(video_encoded)
             # 验证输出维度
             #expected_video_dim = getattr(self.power_normalizer['video'], 'normalized_shape', (None,))
             #expected_video_dim = expected_video_dim[0] if isinstance(expected_video_dim, (list, tuple)) else expected_video_dim
@@ -284,6 +332,7 @@ class MultimodalJSCC(nn.Module):
             guide_vectors['video'] = video_guide
             results['video_encoded'] = video_encoded
             results['video_guide'] = video_guide
+        results['bandwidth_ratio'] = self.bandwidth_ratio
         
         # 功率归一化
         #for modality in encoded_features:
@@ -445,6 +494,7 @@ class MultimodalJSCC(nn.Module):
         # 视频编码
         if video_input is not None:
             video_encoded, video_guide = self.video_encoder(video_input, snr_db=snr_db)
+            video_encoded = self.bandwidth_mask(video_encoded)
             results['video_encoded'] = video_encoded
             results['video_guide'] = video_guide
         
@@ -517,6 +567,11 @@ class MultimodalJSCC(nn.Module):
     def set_snr(self, snr_db: float):
         """设置信噪比"""
         self.channel.set_snr(snr_db)
+
+    def set_bandwidth_ratio(self, ratio: float):
+        """设置带宽门控比例"""
+        self.bandwidth_ratio = float(ratio)
+        self.bandwidth_mask.set_ratio(self.bandwidth_ratio)
     
     def reset_hidden_states(self):
         """重置所有隐藏状态"""
