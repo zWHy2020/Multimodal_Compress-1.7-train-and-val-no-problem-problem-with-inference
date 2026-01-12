@@ -232,6 +232,10 @@ def train_one_epoch(
     
     global_step = epoch * len(train_loader)
     accumulation_steps = config.gradient_accumulation_steps
+    snr_generator = None
+    if config.train_snr_random:
+        snr_generator = torch.Generator(device="cpu")
+        snr_generator.manual_seed(config.seed + epoch)
     
     # 只在每个累积周期的第一步清零梯度
     #optimizer.zero_grad()
@@ -285,7 +289,8 @@ def train_one_epoch(
         
         # 随机SNR（如果启用）
         if config.train_snr_random:
-            snr_db = np.random.uniform(config.train_snr_min, config.train_snr_max)
+            rand_value = torch.rand(1, generator=snr_generator).item()
+            snr_db = config.train_snr_min + (config.train_snr_max - config.train_snr_min) * rand_value
         else:
             snr_db = config.snr_db
         
@@ -556,7 +561,8 @@ def train_one_epoch(
                 f'Step [{batch_idx + 1}/{len(train_loader)}] | '
                 f'Loss {meters["loss"].val:.4f} ({meters["loss"].avg:.4f}) | '
                 f'Time {meters["time"].val:.3f}s | '
-                f'LR {current_lr:.6f}'
+                f'LR {current_lr:.6f} | '
+                f'SNR {snr_db:.2f} dB'
             )
             
             if text_input is not None and meters['text_loss'].count > 0:
@@ -695,6 +701,9 @@ def main():
     parser.add_argument('--max-val-samples', type=int, default=None, help='最大验证样本数（None表示使用全部数据）')
     parser.add_argument('--video-clip-len', type=int, default=None, help='视频训练clip长度')
     parser.add_argument('--video-stride', type=int, default=None, help='视频滑窗stride')
+    parser.add_argument('--train-snr-random', action='store_true', help='训练时启用随机SNR')
+    parser.add_argument('--train-snr-min', type=float, default=None, help='训练随机SNR最小值')
+    parser.add_argument('--train-snr-max', type=float, default=None, help='训练随机SNR最大值')
     parser.add_argument(
         '--video-sampling-strategy',
         type=str,
@@ -764,6 +773,12 @@ def main():
         config.video_sampling_strategy = args.video_sampling_strategy
     if args.video_eval_sampling_strategy:
         config.video_eval_sampling_strategy = args.video_eval_sampling_strategy
+    if args.train_snr_random:
+        config.train_snr_random = True
+    if args.train_snr_min is not None:
+        config.train_snr_min = args.train_snr_min
+    if args.train_snr_max is not None:
+        config.train_snr_max = args.train_snr_max
     
     # 配置日志
     if is_main_process:
@@ -1056,6 +1071,10 @@ def main():
         'video_stride': config.video_stride,
         'video_sampling_strategy': config.video_sampling_strategy,
         'video_eval_sampling_strategy': config.video_eval_sampling_strategy,
+        'snr_db': config.snr_db,
+        'train_snr_random': config.train_snr_random,
+        'train_snr_min': config.train_snr_min,
+        'train_snr_max': config.train_snr_max,
 
     }
     
