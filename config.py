@@ -104,6 +104,10 @@ class TrainingConfig:
         self.video_use_optical_flow = True  # 默认启用光流用于时序对齐
         self.video_use_convlstm = True  # 默认启用ConvLSTM建模时序
         self.video_output_dim = 256
+        self.video_decoder_type = "unet"
+        self.video_unet_base_channels = 64
+        self.video_unet_num_down = 4
+        self.video_unet_num_res_blocks = 2
         
         self.channel_type = "awgn"
       
@@ -229,6 +233,10 @@ class EvaluationConfig:
         self.video_use_optical_flow = True  # 推理侧默认启用光流
         self.video_use_convlstm = True  # 推理侧默认启用ConvLSTM
         self.video_output_dim = 256
+        self.video_decoder_type = "unet"
+        self.video_unet_base_channels = 64
+        self.video_unet_num_down = 4
+        self.video_unet_num_res_blocks = 2
         self.use_amp = False  # 推理是否启用混合精度
         
         self.channel_type = "awgn"

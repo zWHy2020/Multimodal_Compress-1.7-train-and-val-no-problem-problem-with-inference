@@ -14,6 +14,7 @@ import math
 from text_encoder import TextJSCCEncoder, TextJSCCDecoder
 from image_encoder import ImageJSCCEncoder, ImageJSCCDecoder
 from video_encoder import VideoJSCCEncoder, VideoJSCCDecoder
+from video_unet import VideoUNetDecoder
 from cross_attention import MultiModalCrossAttention
 from channel import Channel
 
@@ -100,6 +101,10 @@ class MultimodalJSCC(nn.Module):
         video_use_optical_flow: bool = True,
         video_use_convlstm: bool = True,
         video_output_dim: int = 256,
+        video_decoder_type: str = "unet",
+        video_unet_base_channels: int = 64,
+        video_unet_num_down: int = 4,
+        video_unet_num_res_blocks: int = 2,
         
         # 信道参数
         channel_type: str = "awgn",
@@ -183,16 +188,26 @@ class MultimodalJSCC(nn.Module):
             patch_size=patch_size
             # 不传入 patch_embed, swin_layers, swin_norm，让编码器使用独立路径
         )
-        self.video_decoder = VideoJSCCDecoder(
-            hidden_dim=video_hidden_dim,
-            num_frames=video_num_frames,
-            use_optical_flow=video_use_optical_flow,
-            use_convlstm=video_use_convlstm,
-            input_dim=video_output_dim,
-            img_size=img_size,  # 添加图像尺寸参数，用于上采样
-            patch_size=patch_size,  # 添加 patch 大小参数，用于上采样
-            semantic_context_dim=text_output_dim  # 添加语义上下文维度，用于语义对齐层
-        )
+        if video_decoder_type.lower() == "swin":
+            self.video_decoder = VideoJSCCDecoder(
+                hidden_dim=video_hidden_dim,
+                num_frames=video_num_frames,
+                use_optical_flow=video_use_optical_flow,
+                use_convlstm=video_use_convlstm,
+                input_dim=video_output_dim,
+                img_size=img_size,  # 添加图像尺寸参数，用于上采样
+                patch_size=patch_size,  # 添加 patch 大小参数，用于上采样
+                semantic_context_dim=text_output_dim  # 添加语义上下文维度，用于语义对齐层
+            )
+        else:
+            self.video_decoder = VideoUNetDecoder(
+                in_channels=video_output_dim,
+                out_channels=3,
+                base_channels=video_unet_base_channels,
+                num_down=video_unet_num_down,
+                num_res_blocks=video_unet_num_res_blocks,
+                use_sigmoid=True,
+            )
         
         # 信道模型
         self.channel = Channel(
