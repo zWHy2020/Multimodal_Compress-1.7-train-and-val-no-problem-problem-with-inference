@@ -957,6 +957,7 @@ def load_model(model_path: str, config: EvaluationConfig, device: torch.device, 
         }
         if getattr(config, "pretrained_model_name", None):
             model_config["pretrained_model_name"] = config.pretrained_model_name
+    model_config["snr_db"] = config.snr_db
     try:
          model = MultimodalJSCC(**model_config)
     except TypeError as e:
@@ -1081,6 +1082,9 @@ def main():
     parser.add_argument('--modality', type=str, choices=['image', 'text', 'video'], 
                        default=None, help='模态类型（如果不指定，将从文件扩展名推断）')
     parser.add_argument('--snr', type=float, default=10.0, help='信噪比 (dB)')
+    parser.add_argument('--snr-random', action='store_true', help='推理时启用随机SNR')
+    parser.add_argument('--snr-min', type=float, default=None, help='推理随机SNR最小值')
+    parser.add_argument('--snr-max', type=float, default=None, help='推理随机SNR最大值')
     parser.add_argument('--no-patch', action='store_true', help='禁用patch-based推理')
     parser.add_argument('--video_fps', type=float, default=10.0, help='视频保存帧率')
     parser.add_argument('--infer-window-len', type=int, default=None, help='滑窗推理window长度')
@@ -1124,6 +1128,11 @@ def main():
     config.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     config.model_path = args.model_path
     config.snr_db = args.snr
+    config.snr_random = args.snr_random
+    if args.snr_min is not None:
+        config.snr_min = args.snr_min
+    if args.snr_max is not None:
+        config.snr_max = args.snr_max
     config.use_patch_inference = not args.no_patch
     config.pretrained_model_name = args.pretrained_model_name
     config.infer_window_len = args.infer_window_len
@@ -1131,6 +1140,11 @@ def main():
     config.max_output_frames = args.max_output_frames
     if args.video_sampling_strategy:
         config.video_sampling_strategy = args.video_sampling_strategy
+    if config.snr_random:
+        snr_generator = torch.Generator(device="cpu")
+        snr_generator.manual_seed(config.seed)
+        rand_value = torch.rand(1, generator=snr_generator).item()
+        config.snr_db = config.snr_min + (config.snr_max - config.snr_min) * rand_value
     
     # 推断模态类型
     if args.modality is None:
@@ -1223,7 +1237,12 @@ def main():
     logger.info(f"输入文件: {args.input}")
     logger.info(f"输出路径: {args.output}")
     logger.info(f"模态类型: {modality}")
-    logger.info(f"SNR: {config.snr_db} dB")
+    if config.snr_random:
+        logger.info(
+            f"SNR: {config.snr_db:.2f} dB (random in [{config.snr_min}, {config.snr_max}])"
+        )
+    else:
+        logger.info(f"SNR: {config.snr_db} dB")
     logger.info(f"设备: {config.device}")
     logger.info(f"Patch推理: {'启用' if config.use_patch_inference else '禁用'}")
     logger.info(f"Normalize: {'启用' if args.normalize else '禁用'} (默认与训练一致)")

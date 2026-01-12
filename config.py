@@ -171,6 +171,10 @@ class EvaluationConfig:
         # SNR和Rate列表
         self.snr_list = [-5, -10, -5, 0, 5, 10, 15, 20]
         self.rate_list = None  # Rate列表（如果模型支持），None表示使用默认rate
+        self.snr_db = 10.0
+        self.snr_random = False
+        self.snr_min = -5.0
+        self.snr_max = 15.0
         
         # Patch-based推理设置（用于处理任意尺寸图像）
         self.use_patch_inference = True
@@ -222,7 +226,6 @@ class EvaluationConfig:
         self.use_amp = False  # 推理是否启用混合精度
         
         self.channel_type = "awgn"
-        self.snr_db = 10.0
         # 文本引导与条件约束（评估侧保持与训练一致的开关）
         self.use_text_guidance_image = False
         self.use_text_guidance_video = True
