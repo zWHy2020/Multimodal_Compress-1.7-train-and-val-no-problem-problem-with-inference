@@ -693,6 +693,22 @@ def main():
     parser.add_argument('--epochs', type=int, default=None, help='训练轮数')
     parser.add_argument('--max-samples', type=int, default=None, help='最大训练样本数（用于快速训练，None表示使用全部数据）')
     parser.add_argument('--max-val-samples', type=int, default=None, help='最大验证样本数（None表示使用全部数据）')
+    parser.add_argument('--video-clip-len', type=int, default=None, help='视频训练clip长度')
+    parser.add_argument('--video-stride', type=int, default=None, help='视频滑窗stride')
+    parser.add_argument(
+        '--video-sampling-strategy',
+        type=str,
+        default=None,
+        choices=["contiguous_clip", "uniform", "fixed_start"],
+        help='训练视频采样策略',
+    )
+    parser.add_argument(
+        '--video-eval-sampling-strategy',
+        type=str,
+        default=None,
+        choices=["contiguous_clip", "uniform", "fixed_start"],
+        help='验证视频采样策略',
+    )
     parser.add_argument('--local-rank', type=int, default=None, help='分布式训练的本地进程rank')
     parser.add_argument('--distributed', action='store_true', help='启用分布式训练')
     args = parser.parse_args()
@@ -739,6 +755,15 @@ def main():
         config.batch_size = args.batch_size
     if args.epochs:
         config.num_epochs = args.epochs
+    if args.video_clip_len:
+        config.video_clip_len = args.video_clip_len
+        config.max_video_frames = args.video_clip_len
+    if args.video_stride:
+        config.video_stride = args.video_stride
+    if args.video_sampling_strategy:
+        config.video_sampling_strategy = args.video_sampling_strategy
+    if args.video_eval_sampling_strategy:
+        config.video_eval_sampling_strategy = args.video_eval_sampling_strategy
     
     # 配置日志
     if is_main_process:
@@ -764,6 +789,13 @@ def main():
     logger.info(f"数据目录: {config.data_dir}")
     logger.info(f"训练清单: {config.train_manifest}")
     logger.info(f"验证清单: {config.val_manifest}")
+    logger.info(
+        "视频采样设置: clip_len=%d stride=%d train_strategy=%s val_strategy=%s",
+        config.video_clip_len,
+        config.video_stride,
+        config.video_sampling_strategy,
+        config.video_eval_sampling_strategy,
+    )
     
     # 加载数据清单
     logger.info("加载数据清单...")
@@ -909,6 +941,10 @@ def main():
         image_size=config.img_size,
         max_text_length=config.max_text_length,
         max_video_frames=config.max_video_frames,
+        video_clip_len=config.video_clip_len,
+        video_stride=config.video_stride,
+        video_sampling_strategy=config.video_sampling_strategy,
+        video_eval_sampling_strategy=config.video_eval_sampling_strategy,
         prefetch_factor=getattr(config, 'prefetch_factor', 2),
         allow_missing_modalities=getattr(config, "allow_missing_modalities", False),
         strict_mode=getattr(config, "strict_data_loading", True),
@@ -1016,6 +1052,10 @@ def main():
         'pretrained': getattr(config, 'pretrained', False),
         'freeze_encoder': getattr(config, 'freeze_encoder', False),
         'pretrained_model_name': getattr(config, 'pretrained_model_name', None),
+        'video_clip_len': config.video_clip_len,
+        'video_stride': config.video_stride,
+        'video_sampling_strategy': config.video_sampling_strategy,
+        'video_eval_sampling_strategy': config.video_eval_sampling_strategy,
 
     }
     

@@ -108,6 +108,10 @@ class TrainingConfig:
         self.val_manifest = None
         self.max_text_length = 512
         self.max_video_frames = 3
+        self.video_clip_len = self.max_video_frames
+        self.video_stride = 1
+        self.video_sampling_strategy = "contiguous_clip"
+        self.video_eval_sampling_strategy = "uniform"
         self.max_samples = 65536  # 【Phase 4】默认最大样本数
         self.allow_missing_modalities = False
         self.strict_data_loading = True
@@ -129,6 +133,13 @@ class TrainingConfig:
         log_func(f"Image Embed Dims: {self.img_embed_dims}")
         log_func(f"Image Depths: {self.img_depths}")
         log_func(f"Use Adversarial: {getattr(self, 'use_adversarial', False)}")
+        log_func(
+            "Video sampling: clip_len="
+            f"{getattr(self, 'video_clip_len', None)} stride="
+            f"{getattr(self, 'video_stride', None)} train_strategy="
+            f"{getattr(self, 'video_sampling_strategy', None)} eval_strategy="
+            f"{getattr(self, 'video_eval_sampling_strategy', None)}"
+        )
         log_func("=========================================\n")
 
 
@@ -178,6 +189,13 @@ class EvaluationConfig:
         self.image_size = (256, 256)
         self.max_text_length = 512
         self.max_video_frames = 10
+        self.video_clip_len = self.max_video_frames
+        self.video_stride = 1
+        self.video_sampling_strategy = "contiguous_clip"
+        self.video_eval_sampling_strategy = "uniform"
+        self.infer_window_len = None
+        self.infer_window_stride = None
+        self.max_output_frames = None
         
         # 模型参数（用于加载模型时，通常从检查点恢复）
         self.vocab_size = 10000

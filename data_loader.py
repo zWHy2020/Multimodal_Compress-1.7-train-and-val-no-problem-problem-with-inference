@@ -65,6 +65,10 @@ class MultimodalDataset(Dataset):
         video_transform: Optional[transforms.Compose] = None,
         max_text_length: int = 512,
         max_video_frames: int = 10,
+        video_clip_len: Optional[int] = None,
+        video_stride: int = 1,
+        video_sampling_strategy: str = "contiguous_clip",
+        video_eval_sampling_strategy: str = "uniform",
         image_size: Tuple[int, int] = (224, 224),
         is_train: bool = True,
         allow_missing_modalities: bool = False,
@@ -80,6 +84,10 @@ class MultimodalDataset(Dataset):
         self.video_transform = video_transform or _default_video_transform(image_size, normalize)
         self.max_text_length = max_text_length
         self.max_video_frames = max_video_frames
+        self.video_clip_len = video_clip_len or max_video_frames
+        self.video_stride = video_stride
+        self.video_sampling_strategy = video_sampling_strategy
+        self.video_eval_sampling_strategy = video_eval_sampling_strategy
         self.image_size = image_size
         self.is_train = is_train
         self.allow_missing_modalities = allow_missing_modalities
@@ -148,6 +156,34 @@ class MultimodalDataset(Dataset):
         image = Image.open(full_path).convert("RGB")
         return self.image_transform(image)
 
+    def _resolve_video_sampling_strategy(self) -> str:
+        if self.is_train:
+            return self.video_sampling_strategy
+        return self.video_eval_sampling_strategy or self.video_sampling_strategy
+
+    def _select_video_indices(self, total_frames: int, strategy: str) -> Tuple[List[int], int]:
+        clip_len = self.video_clip_len
+        if total_frames <= 0:
+            raise RuntimeError("视频为空")
+        if strategy == "contiguous_clip":
+            if total_frames >= clip_len:
+                start = self.random_state.randint(0, total_frames - clip_len)
+                return list(range(start, start + clip_len)), clip_len
+            return list(range(total_frames)), total_frames
+        if strategy == "fixed_start":
+            if total_frames >= clip_len:
+                return list(range(0, clip_len)), clip_len
+            return list(range(total_frames)), total_frames
+        if strategy == "uniform":
+            sample_count = min(total_frames, clip_len)
+            indices = (
+                np.linspace(0, total_frames - 1, num=sample_count, dtype=int).tolist()
+                if total_frames > 1
+                else [0] * sample_count
+            )
+            return indices, sample_count
+        raise ValueError(f"不支持的视频采样策略: {strategy}")
+
     def _load_video_frames(self, video_path: str) -> Tuple[torch.Tensor, torch.Tensor]:
         full_path = os.path.join(self.data_dir, video_path)
         cap = cv2.VideoCapture(full_path)
@@ -163,37 +199,44 @@ class MultimodalDataset(Dataset):
                     break
                 total_frames += 1
             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-        sample_count = min(total_frames, self.max_video_frames)
-        if sample_count <= 0:
+        strategy = self._resolve_video_sampling_strategy()
+        target_indices, true_frames = self._select_video_indices(total_frames, strategy)
+        if true_frames <= 0:
             cap.release()
             raise RuntimeError(f"视频为空: {full_path}")
-        target_indices = (
-            np.linspace(0, total_frames - 1, num=sample_count, dtype=int).tolist()
-            if total_frames > 1
-            else [0] * sample_count
-        )
         frames: List[Image.Image] = []
-        current_idx = 0
-        target_ptr = 0
-        while target_ptr < len(target_indices):
-            ret, frame = cap.read()
-            if not ret:
-                break
-            if current_idx == target_indices[target_ptr]:
+        if strategy in {"contiguous_clip", "fixed_start"} and total_frames >= self.video_clip_len:
+            start = target_indices[0]
+            if start > 0:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, start)
+            for _ in range(self.video_clip_len):
+                ret, frame = cap.read()
+                if not ret:
+                    break
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 frames.append(Image.fromarray(frame_rgb))
-                target_ptr += 1
-            current_idx += 1
+        else:
+            current_idx = 0
+            target_ptr = 0
+            while target_ptr < len(target_indices):
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                if current_idx == target_indices[target_ptr]:
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    frames.append(Image.fromarray(frame_rgb))
+                    target_ptr += 1
+                current_idx += 1
         cap.release()
         if not frames:
             raise RuntimeError(f"未能读取任何帧: {full_path}")
         true_frames = len(frames)
         # repeat-last padding
-        while len(frames) < self.max_video_frames:
+        while len(frames) < self.video_clip_len:
             frames.append(frames[-1].copy())
-        video_tensor = torch.stack([self.video_transform(frame) for frame in frames[: self.max_video_frames]])
-        mask = torch.zeros(self.max_video_frames, dtype=torch.float32)
-        mask[: min(true_frames, self.max_video_frames)] = 1.0
+        video_tensor = torch.stack([self.video_transform(frame) for frame in frames[: self.video_clip_len]])
+        mask = torch.zeros(self.video_clip_len, dtype=torch.float32)
+        mask[: min(true_frames, self.video_clip_len)] = 1.0
         return video_tensor, mask
 
     def __getitem__(self, idx: int) -> Optional[Dict[str, Any]]:
@@ -340,6 +383,10 @@ class MultimodalDataLoader:
         image_size: Tuple[int, int] = (224, 224),
         max_text_length: int = 512,
         max_video_frames: int = 10,
+        video_clip_len: Optional[int] = None,
+        video_stride: int = 1,
+        video_sampling_strategy: str = "contiguous_clip",
+        video_eval_sampling_strategy: str = "uniform",
         prefetch_factor: int = 2,
         allow_missing_modalities: bool = False,
         strict_mode: bool = True,
@@ -355,6 +402,10 @@ class MultimodalDataLoader:
         self.image_size = image_size
         self.max_text_length = max_text_length
         self.max_video_frames = max_video_frames
+        self.video_clip_len = video_clip_len
+        self.video_stride = video_stride
+        self.video_sampling_strategy = video_sampling_strategy
+        self.video_eval_sampling_strategy = video_eval_sampling_strategy
         self.prefetch_factor = prefetch_factor
         self.allow_missing_modalities = allow_missing_modalities
         self.strict_mode = strict_mode
@@ -382,6 +433,10 @@ class MultimodalDataLoader:
             video_transform=video_transform,
             max_text_length=self.max_text_length,
             max_video_frames=self.max_video_frames,
+            video_clip_len=self.video_clip_len,
+            video_stride=self.video_stride,
+            video_sampling_strategy=self.video_sampling_strategy,
+            video_eval_sampling_strategy=self.video_eval_sampling_strategy,
             image_size=self.image_size,
             is_train=is_train,
             allow_missing_modalities=self.allow_missing_modalities,
@@ -436,6 +491,8 @@ if __name__ == "__main__":
     parser.add_argument("--manifest", type=str, required=True, help="Manifest v2 路径")
     parser.add_argument("--data_dir", type=str, default=".", help="数据根目录")
     parser.add_argument("--max_video_frames", type=int, default=10)
+    parser.add_argument("--video_clip_len", type=int, default=None)
+    parser.add_argument("--video_sampling_strategy", type=str, default="uniform")
     parser.add_argument("--max_text_length", type=int, default=64)
     parser.add_argument("--image_size", type=int, nargs=2, default=(224, 224))
     parser.add_argument("--normalize", action="store_true", help="启用 ImageNet 归一化")
@@ -450,6 +507,8 @@ if __name__ == "__main__":
         data_list=manifest_data,
         max_text_length=args.max_text_length,
         max_video_frames=args.max_video_frames,
+        video_clip_len=args.video_clip_len,
+        video_sampling_strategy=args.video_sampling_strategy,
         image_size=tuple(args.image_size),
         is_train=False,
         allow_missing_modalities=True,
