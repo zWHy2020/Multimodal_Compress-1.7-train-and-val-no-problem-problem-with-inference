@@ -155,6 +155,23 @@ def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
     return model
 
 
+def compute_bandwidth_ratio(config: TrainingConfig, epoch: int) -> float:
+    start = float(getattr(config, "bandwidth_ratio_start", 1.0))
+    end = float(getattr(config, "bandwidth_ratio_end", start))
+    warmup = max(0, int(getattr(config, "bandwidth_warmup_epochs", 0)))
+    anneal = max(0, int(getattr(config, "bandwidth_anneal_epochs", 0)))
+
+    if end == start:
+        return start
+    if epoch < warmup:
+        return start
+    if anneal <= 0:
+        return end
+    progress = (epoch - warmup + 1) / float(anneal)
+    progress = max(0.0, min(1.0, progress))
+    return start + (end - start) * progress
+
+
 def _log_nonfinite_tensor(
     logger: logging.Logger,
     tensor: torch.Tensor,
@@ -1075,6 +1092,10 @@ def main():
         'train_snr_random': config.train_snr_random,
         'train_snr_min': config.train_snr_min,
         'train_snr_max': config.train_snr_max,
+        'bandwidth_ratio_start': getattr(config, "bandwidth_ratio_start", 1.0),
+        'bandwidth_ratio_end': getattr(config, "bandwidth_ratio_end", 1.0),
+        'bandwidth_warmup_epochs': getattr(config, "bandwidth_warmup_epochs", 0),
+        'bandwidth_anneal_epochs': getattr(config, "bandwidth_anneal_epochs", 0),
 
     }
     
@@ -1087,6 +1108,17 @@ def main():
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
         model_to_save = unwrap_model(model)
+        current_bandwidth_ratio = compute_bandwidth_ratio(config, epoch)
+        if hasattr(model_to_save, "set_bandwidth_ratio"):
+            model_to_save.set_bandwidth_ratio(current_bandwidth_ratio)
+        logger.info(
+            "带宽门控 ratio=%.4f (start=%.4f end=%.4f warmup=%d anneal=%d)",
+            current_bandwidth_ratio,
+            getattr(config, "bandwidth_ratio_start", 1.0),
+            getattr(config, "bandwidth_ratio_end", 1.0),
+            getattr(config, "bandwidth_warmup_epochs", 0),
+            getattr(config, "bandwidth_anneal_epochs", 0),
+        )
         
         # 训练
         train_metrics = train_one_epoch(
