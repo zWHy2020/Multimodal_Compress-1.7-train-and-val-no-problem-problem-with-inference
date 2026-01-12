@@ -746,6 +746,7 @@ class MultimodalLoss(nn.Module):
         rate_weight: float = 1e-4,  # 【新增】码率/能量约束权重
         temporal_consistency_weight: float = 0.0,  # 【新增】视频时序一致性正则权重
         discriminator_weight: float = 0.01,  # 【Phase 3】对抗损失权重（默认较小）
+        gan_weight: Optional[float] = None,  # 【Phase 6】对抗损失权重（统一命名）
         condition_margin_weight: float = 0.0,
         condition_margin: float = 0.05,
         
@@ -768,6 +769,8 @@ class MultimodalLoss(nn.Module):
         
         # 【Phase 3】对抗训练相关
         self.use_adversarial = use_adversarial
+        if gan_weight is not None:
+            discriminator_weight = gan_weight
         self.discriminator_weight = discriminator_weight
         if self.use_adversarial:
             self.adversarial_loss_fn = AdversarialLoss()

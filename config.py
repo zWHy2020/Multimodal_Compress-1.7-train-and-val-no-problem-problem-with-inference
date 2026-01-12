@@ -133,7 +133,12 @@ class TrainingConfig:
         
         # 【Phase 3】对抗训练参数
         self.use_adversarial = False  # 是否使用对抗训练（默认关闭，需要时可启用）
-        self.discriminator_weight = 0.01  # 【Phase 4】对抗损失权重（默认较小）
+        self.gan_enable_epoch = 5  # 【Phase 6】GAN warmup: 前N个epoch只做重建
+        self.d_updates_per_g = 1  # 【Phase 6】判别器更新频率（每次生成器更新对应的D更新次数）
+        self.gan_weight = 0.01  # 【Phase 6】对抗损失权重（默认较小）
+        self.discriminator_weight = self.gan_weight  # 兼容旧字段
+        self.use_r1_regularization = False  # 【Phase 6】可选R1正则
+        self.r1_gamma = 10.0  # 【Phase 6】R1正则强度
         self.ddp_find_unused_parameters = True  # DDP下允许未使用参数（用于缺失模态场景）
         self.use_quantization_noise = True  # 【新增】是否启用量化噪声模拟
         self.quantization_noise_range = 0.5  # 【新增】量化噪声范围（均匀分布 [-r, r]）
