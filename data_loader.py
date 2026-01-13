@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
@@ -41,6 +42,35 @@ def _default_image_transform(image_size: Tuple[int, int], normalize: bool) -> tr
 def _default_video_transform(image_size: Tuple[int, int], normalize: bool) -> transforms.Compose:
     transform_steps = [
         transforms.Resize(image_size),
+        transforms.ToTensor(),
+    ]
+    if normalize:
+        transform_steps.append(transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD))
+    return transforms.Compose(transform_steps)
+
+
+def _round_to_multiple(value: int, multiple: int) -> int:
+    if multiple <= 1:
+        return value
+    return max(multiple, int(round(value / multiple)) * multiple)
+
+
+def _build_dynamic_sizes(
+    image_size: Tuple[int, int],
+    scales: Tuple[float, ...] = (0.75, 1.0, 1.25),
+    multiple: int = 4,
+) -> List[Tuple[int, int]]:
+    sizes = []
+    for scale in scales:
+        h = _round_to_multiple(int(image_size[0] * scale), multiple)
+        w = _round_to_multiple(int(image_size[1] * scale), multiple)
+        sizes.append((max(1, h), max(1, w)))
+    return sorted(set(sizes))
+
+
+def _build_resize_transform(size: Tuple[int, int], normalize: bool) -> transforms.Compose:
+    transform_steps = [
+        transforms.Resize(size),
         transforms.ToTensor(),
     ]
     if normalize:
@@ -80,7 +110,13 @@ class MultimodalDataset(Dataset):
         self.data_dir = data_dir
         self.data_list = list(data_list)
         self.text_tokenizer = text_tokenizer
+        self.dynamic_image_sizes = None
+        self.dynamic_video_sizes = None
+        if image_transform is None and is_train:
+            self.dynamic_image_sizes = _build_dynamic_sizes(image_size)
         self.image_transform = image_transform or _default_image_transform(image_size, normalize)
+        if video_transform is None and is_train:
+            self.dynamic_video_sizes = _build_dynamic_sizes(image_size)
         self.video_transform = video_transform or _default_video_transform(image_size, normalize)
         self.max_text_length = max_text_length
         self.max_video_frames = max_video_frames
@@ -103,6 +139,24 @@ class MultimodalDataset(Dataset):
         self.version = "v2" if any("texts" in item.get("text", {}) for item in self.data_list) else "v1"
         if self.version == "v1":
             warnings.warn("检测到 manifest v1：会导致重复解码与语义错配，建议迁移到 v2。", UserWarning)
+
+    def _select_dynamic_size(self, candidates: Optional[List[Tuple[int, int]]]) -> Optional[Tuple[int, int]]:
+        if not candidates:
+            return None
+        return self.random_state.choice(candidates)
+
+    def _apply_image_transform(self, image: Image.Image) -> torch.Tensor:
+        size = self._select_dynamic_size(self.dynamic_image_sizes)
+        if size is not None:
+            transform = _build_resize_transform(size, self.normalize)
+            return transform(image)
+        return self.image_transform(image)
+
+    def _apply_video_transform(self, frame: Image.Image, size: Optional[Tuple[int, int]]) -> torch.Tensor:
+        if size is not None:
+            transform = _build_resize_transform(size, self.normalize)
+            return transform(frame)
+        return self.video_transform(frame)
 
     def __len__(self) -> int:
         return len(self.data_list)
@@ -154,7 +208,7 @@ class MultimodalDataset(Dataset):
     def _load_image(self, image_path: str) -> torch.Tensor:
         full_path = os.path.join(self.data_dir, image_path)
         image = Image.open(full_path).convert("RGB")
-        return self.image_transform(image)
+        return self._apply_image_transform(image)
 
     def _resolve_video_sampling_strategy(self) -> str:
         if self.is_train:
@@ -246,7 +300,10 @@ class MultimodalDataset(Dataset):
         # repeat-last padding
         while len(frames) < self.video_clip_len:
             frames.append(frames[-1].copy())
-        video_tensor = torch.stack([self.video_transform(frame) for frame in frames[: self.video_clip_len]])
+        target_size = self._select_dynamic_size(self.dynamic_video_sizes)
+        video_tensor = torch.stack(
+            [self._apply_video_transform(frame, target_size) for frame in frames[: self.video_clip_len]]
+        )
         mask = torch.zeros(self.video_clip_len, dtype=torch.float32)
         mask[: min(true_frames, self.video_clip_len)] = 1.0
         return video_tensor, mask
@@ -322,6 +379,24 @@ def _pad_sequence(sequences: List[torch.Tensor], pad_value: int) -> torch.Tensor
     return torch.stack(padded, dim=0)
 
 
+def _pad_image_tensor(image: torch.Tensor, target_h: int, target_w: int) -> torch.Tensor:
+    _, h, w = image.shape
+    pad_h = target_h - h
+    pad_w = target_w - w
+    if pad_h <= 0 and pad_w <= 0:
+        return image
+    return F.pad(image, (0, pad_w, 0, pad_h))
+
+
+def _pad_video_tensor(video: torch.Tensor, target_h: int, target_w: int) -> torch.Tensor:
+    _, _, h, w = video.shape
+    pad_h = target_h - h
+    pad_w = target_w - w
+    if pad_h <= 0 and pad_w <= 0:
+        return video
+    return F.pad(video, (0, pad_w, 0, pad_h))
+
+
 def collate_multimodal_batch(
     batch: List[Optional[Dict[str, Any]]],
     allow_missing_modalities: bool = False,
@@ -357,14 +432,20 @@ def collate_multimodal_batch(
 
     # 图像
     if all("image" in s for s in filtered_samples):
-        images = torch.stack([s["image"] for s in filtered_samples])
+        image_tensors = [s["image"] for s in filtered_samples]
+        max_h = max(img.shape[1] for img in image_tensors)
+        max_w = max(img.shape[2] for img in image_tensors)
+        images = torch.stack([_pad_image_tensor(img, max_h, max_w) for img in image_tensors])
         inputs["image_input"] = images
         targets["image"] = images
         valid_flags["image"] = [s.get("valid", {}).get("image", False) for s in filtered_samples]
 
     # 视频
     if all("video" in s for s in filtered_samples):
-        videos = torch.stack([s["video"] for s in filtered_samples])
+        video_tensors = [s["video"] for s in filtered_samples]
+        max_h = max(vid.shape[2] for vid in video_tensors)
+        max_w = max(vid.shape[3] for vid in video_tensors)
+        videos = torch.stack([_pad_video_tensor(vid, max_h, max_w) for vid in video_tensors])
         inputs["video_input"] = videos
         targets["video"] = videos
         masks = [s.get("video_frame_mask", torch.ones(videos.shape[1])) for s in filtered_samples]

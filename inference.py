@@ -223,16 +223,18 @@ def reconstruct_video_clip(
     use_amp: bool,
 ) -> Tuple[torch.Tensor, str]:
     original_shape = video_clip.shape
-    expected_h, expected_w = (224, 224)
-    if hasattr(model, "image_encoder") and hasattr(model.image_encoder, "patch_embed"):
-        if hasattr(model.image_encoder.patch_embed, "img_size"):
-            expected_h, expected_w = model.image_encoder.patch_embed.img_size
-    pad_multiple = expected_h
+    patch_size = getattr(config, "patch_size", None)
+    if patch_size is None and hasattr(model, "image_encoder") and hasattr(model.image_encoder, "patch_embed"):
+        patch_size = getattr(model.image_encoder.patch_embed, "patch_size", 128)
+    patch_size = patch_size or 128
+    pad_multiple = patch_size
     padded_video, pad_h, pad_w = pad_image(video_clip, pad_multiple)
-    need_patch = (original_shape[2] != expected_h or original_shape[3] != expected_w)
-    if need_patch and config.use_patch_inference:
+    need_patch = config.use_patch_inference and (
+        original_shape[2] > patch_size or original_shape[3] > patch_size
+    )
+    if need_patch:
         path_used = "clip-patch-video"
-        patches, meta = split_video_clip_patches(padded_video, expected_h, config.patch_overlap)
+        patches, meta = split_video_clip_patches(padded_video, patch_size, config.patch_overlap)
         patch_results_list = []
         patch_batch_size = 2
         for i in range(0, len(patches), patch_batch_size):
@@ -472,25 +474,29 @@ def infer_image(
     model.eval()
     with torch.no_grad():
         # 检查是否需要patch推理
-        expected_h, expected_w = (224, 224)  # 默认值
-        if hasattr(model, 'image_encoder') and hasattr(model.image_encoder, 'patch_embed'):
-            if hasattr(model.image_encoder.patch_embed, 'img_size'):
-                expected_h, expected_w = model.image_encoder.patch_embed.img_size
+        patch_size = getattr(config, "patch_size", None)
+        if patch_size is None and hasattr(model, "image_encoder") and hasattr(model.image_encoder, "patch_embed"):
+            patch_size = getattr(model.image_encoder.patch_embed, "patch_size", 128)
+        patch_size = patch_size or 128
+        need_patch = config.use_patch_inference and (
+            original_shape[0] > patch_size or original_shape[1] > patch_size
+        )
         
-        need_patch = (original_shape[0] != expected_h or original_shape[1] != expected_w)
-        
-        if need_patch and config.use_patch_inference:
-            pad_multiple = expected_h
+        if need_patch:
+            pad_multiple = patch_size
             padded_image, pad_h, pad_w = pad_image(image, pad_multiple)
             logger.info(f"使用 patch-based 推理（patch_size={config.patch_size}, overlap={config.patch_overlap}）")
             
             # 分割图像
             #patches, meta = split_image_v2(image, config.patch_size, config.patch_overlap)
             #patches, meta = split_image_v2(image, expected_h, config.patch_overlap)
-            patches, meta = split_image_v2(padded_image, expected_h, config.patch_overlap) # <--- 替换为这行
-            logger.info(f"使用 patch-based 推理（patch_size={expected_h}, overlap={config.patch_overlap}）")
+            patches, meta = split_image_v2(padded_image, patch_size, config.patch_overlap)
+            logger.info(f"使用 patch-based 推理（patch_size={patch_size}, overlap={config.patch_overlap}）")
             patches = patches.to(device)
-            global_input = transforms.functional.resize(image, (expected_h, expected_w))
+            if max(original_shape) > patch_size:
+                global_input = transforms.functional.resize(image, (patch_size, patch_size))
+            else:
+                global_input = image
             global_input = global_input.unsqueeze(0).to(device)
             
             logger.info(f"图像分割为 {len(patches)} 个 patches")
