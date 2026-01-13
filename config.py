@@ -107,7 +107,7 @@ class TrainingConfig:
         self.video_decoder_type = "unet"
         self.video_unet_base_channels = 64
         self.video_unet_num_down = 4
-        self.video_unet_num_res_blocks = 2
+        self.video_unet_num_res_blocks = 3
         
         self.channel_type = "awgn"
       
@@ -241,7 +241,7 @@ class EvaluationConfig:
         self.video_decoder_type = "unet"
         self.video_unet_base_channels = 64
         self.video_unet_num_down = 4
-        self.video_unet_num_res_blocks = 2
+        self.video_unet_num_res_blocks = 3
         self.use_amp = False  # 推理是否启用混合精度
         
         self.channel_type = "awgn"
