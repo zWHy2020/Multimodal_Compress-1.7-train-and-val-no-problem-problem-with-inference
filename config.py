@@ -79,9 +79,9 @@ class TrainingConfig:
 
         # 带宽/码率调度（通道门控）
         self.bandwidth_ratio_start = 1.0
-        self.bandwidth_ratio_end = 1.0
-        self.bandwidth_warmup_epochs = 0
-        self.bandwidth_anneal_epochs = 0
+        self.bandwidth_ratio_end = 0.5
+        self.bandwidth_warmup_epochs = 5
+        self.bandwidth_anneal_epochs = 20
         # 模型参数
         self.vocab_size = 65536
         self.text_embed_dim = 512
@@ -107,7 +107,7 @@ class TrainingConfig:
         self.video_decoder_type = "unet"
         self.video_unet_base_channels = 64
         self.video_unet_num_down = 4
-        self.video_unet_num_res_blocks = 2
+        self.video_unet_num_res_blocks = 3
         
         self.channel_type = "awgn"
       
@@ -241,7 +241,7 @@ class EvaluationConfig:
         self.video_decoder_type = "unet"
         self.video_unet_base_channels = 64
         self.video_unet_num_down = 4
-        self.video_unet_num_res_blocks = 2
+        self.video_unet_num_res_blocks = 3
         self.use_amp = False  # 推理是否启用混合精度
         
         self.channel_type = "awgn"

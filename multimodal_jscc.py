@@ -104,7 +104,7 @@ class MultimodalJSCC(nn.Module):
         video_decoder_type: str = "unet",
         video_unet_base_channels: int = 64,
         video_unet_num_down: int = 4,
-        video_unet_num_res_blocks: int = 2,
+        video_unet_num_res_blocks: int = 3,
         
         # 信道参数
         channel_type: str = "awgn",
