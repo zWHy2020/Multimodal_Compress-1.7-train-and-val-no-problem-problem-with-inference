@@ -79,9 +79,9 @@ class TrainingConfig:
 
         # 带宽/码率调度（通道门控）
         self.bandwidth_ratio_start = 1.0
-        self.bandwidth_ratio_end = 1.0
-        self.bandwidth_warmup_epochs = 0
-        self.bandwidth_anneal_epochs = 0
+        self.bandwidth_ratio_end = 0.5
+        self.bandwidth_warmup_epochs = 5
+        self.bandwidth_anneal_epochs = 20
         # 模型参数
         self.vocab_size = 65536
         self.text_embed_dim = 512
