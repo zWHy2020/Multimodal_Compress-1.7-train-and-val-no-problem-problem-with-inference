@@ -163,25 +163,33 @@ class MultimodalDataset(Dataset):
 
     def _select_video_indices(self, total_frames: int, strategy: str) -> Tuple[List[int], int]:
         clip_len = self.video_clip_len
+        stride = max(1, int(self.video_stride))
         if total_frames <= 0:
             raise RuntimeError("视频为空")
         if strategy == "contiguous_clip":
-            if total_frames >= clip_len:
-                start = self.random_state.randint(0, total_frames - clip_len)
-                return list(range(start, start + clip_len)), clip_len
+            effective_span = (clip_len - 1) * stride + 1
+            if total_frames >= effective_span:
+                start = self.random_state.randint(0, total_frames - effective_span)
+                return [start + i * stride for i in range(clip_len)], clip_len
             return list(range(total_frames)), total_frames
         if strategy == "fixed_start":
-            if total_frames >= clip_len:
-                return list(range(0, clip_len)), clip_len
+            effective_span = (clip_len - 1) * stride + 1
+            if total_frames >= effective_span:
+                return [i * stride for i in range(clip_len)], clip_len
             return list(range(total_frames)), total_frames
         if strategy == "uniform":
-            sample_count = min(total_frames, clip_len)
-            indices = (
-                np.linspace(0, total_frames - 1, num=sample_count, dtype=int).tolist()
-                if total_frames > 1
-                else [0] * sample_count
-            )
-            return indices, sample_count
+            candidate_indices = list(range(0, total_frames, stride))
+            sample_count = min(len(candidate_indices), clip_len)
+            if sample_count <= 0:
+                return [0], 1
+            if len(candidate_indices) == sample_count:
+                return candidate_indices, sample_count
+            if len(candidate_indices) > 1:
+                linspace_positions = np.linspace(
+                    0, len(candidate_indices) - 1, num=sample_count, dtype=int
+                ).tolist()
+                return [candidate_indices[i] for i in linspace_positions], sample_count
+            return [candidate_indices[0]] * sample_count, sample_count
         raise ValueError(f"不支持的视频采样策略: {strategy}")
 
     def _load_video_frames(self, video_path: str) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -205,7 +213,11 @@ class MultimodalDataset(Dataset):
             cap.release()
             raise RuntimeError(f"视频为空: {full_path}")
         frames: List[Image.Image] = []
-        if strategy in {"contiguous_clip", "fixed_start"} and total_frames >= self.video_clip_len:
+        if (
+            strategy in {"contiguous_clip", "fixed_start"}
+            and total_frames >= self.video_clip_len
+            and self.video_stride == 1
+        ):
             start = target_indices[0]
             if start > 0:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, start)
