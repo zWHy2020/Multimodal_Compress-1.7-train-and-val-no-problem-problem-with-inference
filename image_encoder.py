@@ -1411,17 +1411,54 @@ class ImageJSCCDecoder(nn.Module):
         x = self.norm(x)
         
         # 重塑为图像格式
-        # 注意：经过解码器层后，特征序列长度应该等于patches_resolution
-        # 例如：经过所有层后，最终输出是 [B, 3136, 96]，其中 3136 = 56*56 = patches_resolution
+        # 注意：经过解码器层后，特征序列长度应该等于输出分辨率
         B, L, C = x.shape
-        H, W = output_resolution
-        
-        # 验证：确保 L == H * W（patches_resolution）
-        if L != H * W:
-            raise RuntimeError(
-                f"ImageJSCCDecoder重塑失败：序列长度 L={L} 不等于预期的 H*W={H}*{W}={H*W}。"
-                f"请检查上采样配置是否正确，patches_resolution={self.patches_resolution}。"
+        inferred_resolution = None
+        if input_resolution is not None:
+            inferred_resolution = (
+                input_resolution[0] * (2 ** (self.num_layers - 1)),
+                input_resolution[1] * (2 ** (self.num_layers - 1)),
             )
+        if output_resolution is None:
+            output_resolution = inferred_resolution or self.patches_resolution
+        H, W = output_resolution
+
+        if L != H * W:
+            resolved = None
+            side = int(math.sqrt(L))
+            if side * side == L:
+                resolved = (side, side)
+
+            def _resolve_from_ratio(ratio: Optional[float]) -> Optional[Tuple[int, int]]:
+                if ratio is None or ratio <= 0:
+                    return None
+                cand_h = int(round(math.sqrt(L * ratio)))
+                if cand_h <= 0:
+                    return None
+                if L % cand_h != 0:
+                    return None
+                cand_w = L // cand_h
+                if cand_w <= 0:
+                    return None
+                if abs((cand_h / cand_w) - ratio) > 0.01:
+                    return None
+                return cand_h, cand_w
+
+            if resolved is None and inferred_resolution:
+                if inferred_resolution[0] * inferred_resolution[1] == L:
+                    resolved = inferred_resolution
+                else:
+                    resolved = _resolve_from_ratio(inferred_resolution[0] / inferred_resolution[1])
+            if resolved is None:
+                resolved = _resolve_from_ratio(H / W if W else None)
+            if resolved is None:
+                resolved = _resolve_from_ratio(self.patches_resolution[0] / self.patches_resolution[1])
+            if resolved is None:
+                raise RuntimeError(
+                    f"ImageJSCCDecoder重塑失败：序列长度 L={L} 不等于预期的 H*W={H}*{W}={H*W}。"
+                    f"请检查上采样配置是否正确，patches_resolution={self.patches_resolution}。"
+                )
+            H, W = resolved
         
         x = x.view(B, H, W, C).permute(0, 3, 1, 2)
         #for i, layer in enumerate(self.layers):
