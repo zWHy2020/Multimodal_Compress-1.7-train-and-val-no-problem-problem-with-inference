@@ -834,6 +834,7 @@ class ImageJSCCEncoder(nn.Module):
         swin_layers: Optional[nn.ModuleList] = None,
         swin_norm: Optional[nn.Module] = None,
         pretrained: bool = False,  # 【Phase 1】是否使用预训练权重
+        disable_timm_pretrained: bool = True,  # 策略A：默认禁用timm预训练路径
         freeze_encoder: bool = False,  # 【Phase 1】是否冻结编码器主干（仅训练适配器）
         pretrained_model_name: str = 'swin_tiny_patch4_window7_224'  # 【Phase 1】预训练模型名称
     ):
@@ -841,6 +842,11 @@ class ImageJSCCEncoder(nn.Module):
         self.num_layers = len(depths)
         self.embed_dims = embed_dims
         self.patches_resolution = (img_size[0] // patch_size, img_size[1] // patch_size)
+        if pretrained and disable_timm_pretrained:
+            logger.warning(
+                "已选择禁用timm预训练路径（策略A），将使用仓库内部动态Swin实现。"
+            )
+            pretrained = False
         self.pretrained = pretrained and TIMM_AVAILABLE
         self.freeze_encoder = freeze_encoder
         self.snr_modulators = nn.ModuleList()
