@@ -652,7 +652,7 @@ class SwinTransformerBlock(nn.Module):
         del shifted_x  # 及时释放
         if pad_b or pad_r:
             x = x[:, :H, :W, :]
-        x = x.view(B, H * W, C)
+        x = x.reshape(B, H * W, C)
         
         # 前馈网络（使用梯度检查点以降低显存峰值）
         x = shortcut + self.drop_path(x)
