@@ -105,6 +105,7 @@ class VideoUNetDecoder(nn.Module):
         guide_vectors: Optional[torch.Tensor] = None,
         reset_state: bool = False,
         semantic_context: Optional[torch.Tensor] = None,
+        output_size: Optional[Tuple[int, int]] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -112,6 +113,7 @@ class VideoUNetDecoder(nn.Module):
             guide_vectors: 未使用，保持接口兼容。
             reset_state: 未使用，保持接口兼容。
             semantic_context: 未使用，保持接口兼容。
+            output_size: 可选输出裁剪尺寸 (H, W)。
         Returns:
             重建视频 [B, T, C_out, H, W]
         """
@@ -139,5 +141,10 @@ class VideoUNetDecoder(nn.Module):
             x = self.up_blocks[i](x)
 
         x = self.out_act(self.out_conv(x))
-        x = x.view(b, t, self.out_channels, h, w)
+        h_out, w_out = h, w
+        if output_size is not None:
+            h_out = min(int(output_size[0]), x.shape[-2])
+            w_out = min(int(output_size[1]), x.shape[-1])
+            x = x[..., :h_out, :w_out]
+        x = x.view(b, t, self.out_channels, h_out, w_out)
         return x
