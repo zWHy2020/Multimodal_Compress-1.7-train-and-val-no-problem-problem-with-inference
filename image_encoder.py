@@ -261,7 +261,11 @@ class PatchMerging(nn.Module):
         self.reduction = nn.Linear(4 * dim, self.out_dim, bias=False)
         self.norm = norm_layer(4 * dim) if norm_layer else None
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        input_resolution: Optional[Tuple[int, int]] = None,
+    ) -> Tuple[torch.Tensor, Tuple[int, int]]:
         """
         前向传播
         

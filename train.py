@@ -957,9 +957,21 @@ def main():
     
     # 【Phase 1】如果启用预训练，记录信息
     if getattr(config, 'pretrained', False):
-        logger.info(f"【Phase 1】使用预训练权重: {getattr(config, 'pretrained_model_name', 'swin_tiny_patch4_window7_224')}")
-        if getattr(config, 'freeze_encoder', False):
-            logger.info("【Phase 1】编码器主干已冻结，仅训练适配器层")
+        real_model = unwrap_model(model)
+        image_encoder = getattr(real_model, "image_encoder", None)
+        image_pretrained_active = bool(getattr(image_encoder, "pretrained", False))
+        if image_pretrained_active:
+            logger.info(
+                "【Phase 1】使用预训练权重: "
+                f"{getattr(config, 'pretrained_model_name', 'swin_tiny_patch4_window7_224')}"
+            )
+            if getattr(config, 'freeze_encoder', False):
+                logger.info("【Phase 1】编码器主干已冻结，仅训练适配器层")
+        else:
+            logger.info(
+                "【Phase 1】预训练权重在配置中启用，但当前图像编码器未加载预训练权重，"
+                "将使用随机初始化。"
+            )
     
     # 打印模型信息
     total_params = sum(p.numel() for p in model.parameters())
