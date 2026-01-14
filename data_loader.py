@@ -57,7 +57,7 @@ def _round_to_multiple(value: int, multiple: int) -> int:
 
 def _build_dynamic_sizes(
     image_size: Tuple[int, int],
-    scales: Tuple[float, ...] = (0.75, 1.0, 1.25),
+    scales: Tuple[float, ...] = (1.0, 1.25),
     multiple: int = 4,
 ) -> List[Tuple[int, int]]:
     sizes = []
