@@ -8,6 +8,7 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class ResBlock(nn.Module):
@@ -143,8 +144,9 @@ class VideoUNetDecoder(nn.Module):
         x = self.out_act(self.out_conv(x))
         h_out, w_out = h, w
         if output_size is not None:
-            h_out = min(int(output_size[0]), x.shape[-2])
-            w_out = min(int(output_size[1]), x.shape[-1])
-            x = x[..., :h_out, :w_out]
+            h_out = int(output_size[0])
+            w_out = int(output_size[1])
+            if x.shape[-2:] != (h_out, w_out):
+                x = F.interpolate(x, size=(h_out, w_out), mode="bilinear", align_corners=False)
         x = x.view(b, t, self.out_channels, h_out, w_out)
         return x
