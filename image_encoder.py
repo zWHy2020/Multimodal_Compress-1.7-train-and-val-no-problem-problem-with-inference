@@ -261,7 +261,11 @@ class PatchMerging(nn.Module):
         self.reduction = nn.Linear(4 * dim, self.out_dim, bias=False)
         self.norm = norm_layer(4 * dim) if norm_layer else None
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        input_resolution: Optional[Tuple[int, int]] = None,
+    ) -> Tuple[torch.Tensor, Tuple[int, int]]:
         """
         前向传播
         
@@ -648,7 +652,7 @@ class SwinTransformerBlock(nn.Module):
         del shifted_x  # 及时释放
         if pad_b or pad_r:
             x = x[:, :H, :W, :]
-        x = x.view(B, H * W, C)
+        x = x.reshape(B, H * W, C)
         
         # 前馈网络（使用梯度检查点以降低显存峰值）
         x = shortcut + self.drop_path(x)
