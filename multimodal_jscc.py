@@ -295,12 +295,6 @@ class MultimodalJSCC(nn.Module):
                 f"图像输入应为4D张量 [B, C, H, W]，实际为 {image_input.dim()}D，shape={tuple(image_input.shape)}"
             )
             expected_img_hw = None
-            if hasattr(self.image_encoder, 'patch_embed') and hasattr(self.image_encoder.patch_embed, 'img_size'):
-                expected_img_hw = tuple(self.image_encoder.patch_embed.img_size)
-            if expected_img_hw is not None:
-                assert tuple(image_input.shape[-2:]) == expected_img_hw, (
-                    f"图像输入空间尺寸不匹配: got HxW={tuple(image_input.shape[-2:])}, expected={expected_img_hw}"
-                )
             
             # 调用编码器
             image_encoded, image_guide = self.image_encoder(image_input, snr_db=snr_db)
@@ -393,7 +387,10 @@ class MultimodalJSCC(nn.Module):
                 transmitted_features['image'],
                 guide_vectors['image'],
                 semantic_context=semantic_for_image,  # 路线1默认禁用 text->image
-                snr_db=snr_db
+                snr_db=snr_db,
+                input_resolution=getattr(self.image_encoder, "last_latent_resolution", None),
+                output_resolution=getattr(self.image_encoder, "last_patch_resolution", None),
+                output_size=getattr(self.image_encoder, "last_input_size", None),
             )
             decoded_outputs['image'] = image_decoded
             results['image_decoded'] = image_decoded
@@ -406,7 +403,8 @@ class MultimodalJSCC(nn.Module):
             video_decoded = self.video_decoder(
                 transmitted_features['video'],
                 guide_vectors['video'],
-                semantic_context=semantic_for_video  # None 时视频解码不会走语义 cross-attention
+                semantic_context=semantic_for_video,  # None 时视频解码不会走语义 cross-attention
+                output_size=getattr(self.video_encoder, "last_input_size", None),
             )
             decoded_outputs['video'] = video_decoded
             results['video_decoded'] = video_decoded

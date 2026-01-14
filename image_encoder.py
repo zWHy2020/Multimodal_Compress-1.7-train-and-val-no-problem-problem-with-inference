@@ -205,7 +205,11 @@ class PatchEmbed(nn.Module):
         self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
         self.norm = norm_layer(embed_dim) if norm_layer else None
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        input_resolution: Optional[Tuple[int, int]] = None,
+    ) -> Tuple[torch.Tensor, Tuple[int, int]]:
         """
         前向传播
         
@@ -216,8 +220,16 @@ class PatchEmbed(nn.Module):
             torch.Tensor: 嵌入特征 [B, num_patches, embed_dim]
         """
         B, C, H, W = x.shape
-        assert H == self.img_size[0] and W == self.img_size[1], \
-            f"输入图像尺寸 {H}x{W} 与预期尺寸 {self.img_size} 不匹配"
+        pad_h = (self.patch_size - H % self.patch_size) % self.patch_size
+        pad_w = (self.patch_size - W % self.patch_size) % self.patch_size
+        if pad_h or pad_w:
+            x = F.pad(x, (0, pad_w, 0, pad_h))
+        H_pad, W_pad = H + pad_h, W + pad_w
+        self.last_input_size = (H, W)
+        self.last_pad = (pad_h, pad_w)
+        self.last_padded_size = (H_pad, W_pad)
+        self.grid_size = (H_pad // self.patch_size, W_pad // self.patch_size)
+        self.num_patches = self.grid_size[0] * self.grid_size[1]
         
         x = self.proj(x).flatten(2).transpose(1, 2)  # [B, num_patches, embed_dim]
         
@@ -259,11 +271,18 @@ class PatchMerging(nn.Module):
         Returns:
             torch.Tensor: 合并后的特征 [B, H*W/4, out_dim]
         """
-        H, W = self.input_resolution
+        H, W = input_resolution or self.input_resolution
         B, L, C = x.shape
-        assert L == H * W, "输入特征长度与分辨率不匹配"
+        if L != H * W:
+            raise RuntimeError("输入特征长度与分辨率不匹配")
         
-        x = x.view(B, H, W, C)
+        x = x.view(B, H, W, C).permute(0, 3, 1, 2)
+        pad_h = H % 2
+        pad_w = W % 2
+        if pad_h or pad_w:
+            x = F.pad(x, (0, pad_w, 0, pad_h))
+        H_pad, W_pad = H + pad_h, W + pad_w
+        x = x.permute(0, 2, 3, 1)
         
         # 合并2x2的patches
         x0 = x[:, 0::2, 0::2, :]  # [B, H/2, W/2, C]
@@ -278,7 +297,7 @@ class PatchMerging(nn.Module):
             x = self.norm(x)
         
         x = self.reduction(x)
-        return x
+        return x, (H_pad // 2, W_pad // 2)
 
 
 class PatchReverseMerging(nn.Module):
@@ -313,7 +332,11 @@ class PatchReverseMerging(nn.Module):
         #self.expansion = nn.Linear(dim, 4 * self.out_dim, bias=False)
         #self.norm = norm_layer(dim) if norm_layer else None
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        input_resolution: Optional[Tuple[int, int]] = None,
+    ) -> Tuple[torch.Tensor, Tuple[int, int]]:
         """
         前向传播
         
@@ -323,7 +346,7 @@ class PatchReverseMerging(nn.Module):
         Returns:
             torch.Tensor: 分离后的特征 [B, H*W*4, out_dim]
         """
-        H, W = self.input_resolution
+        H, W = input_resolution or self.input_resolution
         B, L, C = x.shape
         
         if self.norm is not None:
@@ -349,7 +372,7 @@ class PatchReverseMerging(nn.Module):
         #x[:, 1::2, 1::2, :] = x3
         
         #x = x.view(B, -1, self.out_dim)
-        return x
+        return x, (H * 2, W * 2)
 
 
 class WindowAttention(nn.Module):
@@ -496,11 +519,9 @@ class SwinTransformerBlock(nn.Module):
         self.window_size = window_size
         self.shift_size = shift_size
         self.mlp_ratio = mlp_ratio
-        
         if min(self.input_resolution) <= self.window_size:
             self.shift_size = 0
             self.window_size = min(self.input_resolution)
-        
         assert 0 <= self.shift_size < self.window_size, "shift_size必须在0到window_size之间"
         
         self.norm1 = norm_layer(dim)
@@ -516,32 +537,47 @@ class SwinTransformerBlock(nn.Module):
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
         
-        if self.shift_size > 0:
-            # 计算移位窗口的注意力掩码
-            H, W = self.input_resolution
-            img_mask = torch.zeros((1, H, W, 1))
-            h_slices = (slice(0, -self.window_size),
-                       slice(-self.window_size, -self.shift_size),
-                       slice(-self.shift_size, None))
-            w_slices = (slice(0, -self.window_size),
-                       slice(-self.window_size, -self.shift_size),
-                       slice(-self.shift_size, None))
-            cnt = 0
-            for h in h_slices:
-                for w in w_slices:
-                    img_mask[:, h, w, :] = cnt
-                    cnt += 1
-            
-            mask_windows = window_partition(img_mask, self.window_size)
-            mask_windows = mask_windows.view(-1, self.window_size * self.window_size)
-            attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
-            attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
-        else:
-            attn_mask = None
-        
-        self.register_buffer("attn_mask", attn_mask)
-    
-    def forward(self, x: torch.Tensor, use_checkpoint: bool = False) -> torch.Tensor:
+        self.register_buffer("attn_mask", None, persistent=False)
+
+    def _build_attn_mask(
+        self,
+        H: int,
+        W: int,
+        window_size: int,
+        shift_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        if shift_size <= 0:
+            return None
+        img_mask = torch.zeros((1, H, W, 1), device=device, dtype=dtype)
+        h_slices = (
+            slice(0, -window_size),
+            slice(-window_size, -shift_size),
+            slice(-shift_size, None),
+        )
+        w_slices = (
+            slice(0, -window_size),
+            slice(-window_size, -shift_size),
+            slice(-shift_size, None),
+        )
+        cnt = 0
+        for h in h_slices:
+            for w in w_slices:
+                img_mask[:, h, w, :] = cnt
+                cnt += 1
+        mask_windows = window_partition(img_mask, window_size)
+        mask_windows = mask_windows.view(-1, window_size * window_size)
+        attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
+        attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
+        return attn_mask
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        input_resolution: Optional[Tuple[int, int]] = None,
+        use_checkpoint: bool = False,
+    ) -> torch.Tensor:
         """
         前向传播（内存优化版本）
         
@@ -552,17 +588,33 @@ class SwinTransformerBlock(nn.Module):
         Returns:
             torch.Tensor: 输出特征
         """
-        H, W = self.input_resolution
+        H, W = input_resolution or self.input_resolution
         B, L, C = x.shape
         assert L == H * W, "输入特征长度与分辨率不匹配"
-        
+
+        if H < self.window_size or W < self.window_size:
+            raise RuntimeError(
+                f"输入分辨率 {H}x{W} 小于窗口大小 {self.window_size}，"
+                "无法进行窗口注意力。"
+            )
         shortcut = x
         x = self.norm1(x)
         x = x.view(B, H, W, C)
+        pad_b = (self.window_size - H % self.window_size) % self.window_size
+        pad_r = (self.window_size - W % self.window_size) % self.window_size
+        if pad_b or pad_r:
+            x = x.permute(0, 3, 1, 2)
+            x = F.pad(x, (0, pad_r, 0, pad_b))
+            x = x.permute(0, 2, 3, 1)
+        H_pad, W_pad = H + pad_b, W + pad_r
+        shift_size = self.shift_size if min(H_pad, W_pad) > self.window_size else 0
+        attn_mask = self._build_attn_mask(
+            H_pad, W_pad, self.window_size, shift_size, x.device, x.dtype
+        )
         
         # 循环移位
-        if self.shift_size > 0:
-            shifted_x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+        if shift_size > 0:
+            shifted_x = torch.roll(x, shifts=(-shift_size, -shift_size), dims=(1, 2))
         else:
             shifted_x = x
         
@@ -576,24 +628,26 @@ class SwinTransformerBlock(nn.Module):
             # 使用梯度检查点：在反向传播时重新计算，以节省显存
             # 创建包装函数以支持关键字参数
             def attn_with_mask(x):
-                return self.attn(x, mask=self.attn_mask)
+                return self.attn(x, mask=attn_mask)
             attn_windows = checkpoint(attn_with_mask, x_windows, use_reentrant=False)
         else:
-            attn_windows = self.attn(x_windows, mask=self.attn_mask)
+            attn_windows = self.attn(x_windows, mask=attn_mask)
         del x_windows  # 及时释放
         
         attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
         
         # 窗口重组
-        shifted_x = window_reverse(attn_windows, self.window_size, H, W)
+        shifted_x = window_reverse(attn_windows, self.window_size, H_pad, W_pad)
         del attn_windows  # 及时释放
         
         # 反向循环移位
-        if self.shift_size > 0:
-            x = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
+        if shift_size > 0:
+            x = torch.roll(shifted_x, shifts=(shift_size, shift_size), dims=(1, 2))
         else:
             x = shifted_x
         del shifted_x  # 及时释放
+        if pad_b or pad_r:
+            x = x[:, :H, :W, :]
         x = x.view(B, H * W, C)
         
         # 前馈网络（使用梯度检查点以降低显存峰值）
@@ -722,7 +776,12 @@ class BasicLayer(nn.Module):
             self.downsample = None
             self.output_resolution = input_resolution
     
-    def forward(self, x: torch.Tensor, use_checkpoint: bool = False) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        input_resolution: Optional[Tuple[int, int]] = None,
+        use_checkpoint: bool = False,
+    ) -> Tuple[torch.Tensor, Tuple[int, int]]:
         """
         前向传播
         
@@ -733,15 +792,16 @@ class BasicLayer(nn.Module):
         Returns:
             torch.Tensor: 输出特征
         """
+        resolution = input_resolution or self.input_resolution
         # 先经过本层的 Swin Transformer 块
         for i, blk in enumerate(self.blocks):
-            x = blk(x, use_checkpoint=use_checkpoint)
+            x = blk(x, input_resolution=resolution, use_checkpoint=use_checkpoint)
 
         # 再进行下采样/上采样（若配置）
         if self.downsample is not None:
-            x = self.downsample(x)
+            x, resolution = self.downsample(x, input_resolution=resolution)
         
-        return x
+        return x, resolution
 
 
 class ImageJSCCEncoder(nn.Module):
@@ -774,6 +834,7 @@ class ImageJSCCEncoder(nn.Module):
         swin_layers: Optional[nn.ModuleList] = None,
         swin_norm: Optional[nn.Module] = None,
         pretrained: bool = False,  # 【Phase 1】是否使用预训练权重
+        disable_timm_pretrained: bool = True,  # 策略A：默认禁用timm预训练路径
         freeze_encoder: bool = False,  # 【Phase 1】是否冻结编码器主干（仅训练适配器）
         pretrained_model_name: str = 'swin_tiny_patch4_window7_224'  # 【Phase 1】预训练模型名称
     ):
@@ -781,6 +842,11 @@ class ImageJSCCEncoder(nn.Module):
         self.num_layers = len(depths)
         self.embed_dims = embed_dims
         self.patches_resolution = (img_size[0] // patch_size, img_size[1] // patch_size)
+        if pretrained and disable_timm_pretrained:
+            logger.warning(
+                "已选择禁用timm预训练路径（策略A），将使用仓库内部动态Swin实现。"
+            )
+            pretrained = False
         self.pretrained = pretrained and TIMM_AVAILABLE
         self.freeze_encoder = freeze_encoder
         self.snr_modulators = nn.ModuleList()
@@ -987,24 +1053,28 @@ class ImageJSCCEncoder(nn.Module):
             L = H * W
         else:
             B, L, C = x.shape
-        # 断言：序列长度应等于 patches_resolution 的乘积
-        
-        expected_L = self.patches_resolution[0] * self.patches_resolution[1]
-        assert L == expected_L, (
-            f"ImageJSCCEncoder.patch_embed 输出序列长度不匹配: got L={L},"
-            f" expected {expected_L} (from patches_resolution={self.patches_resolution})"
-        )
+        patch_resolution = getattr(self.patch_embed, "grid_size", self.patches_resolution)
+        self.last_input_size = getattr(self.patch_embed, "last_input_size", None)
+        self.last_pad = getattr(self.patch_embed, "last_pad", (0, 0))
+        self.last_patch_resolution = patch_resolution
         
         # 通过编码器层
         # 注意：移除 try-except 以暴露真正的错误，便于调试
+        resolution = patch_resolution
         for i, layer in enumerate(self.layers):
             if self.pretrained:
                 x = layer(x)
             else:
-                x = layer(x, use_checkpoint=self.training)
+                x, resolution = layer(x, input_resolution=resolution, use_checkpoint=self.training)
             if i < len(self.snr_modulators):
                 x = self.snr_modulators[i](x, snr_db)
         x = self.norm(x)
+        if self.pretrained:
+            resolution = (
+                patch_resolution[0] // (2 ** (self.num_layers - 1)),
+                patch_resolution[1] // (2 ** (self.num_layers - 1)),
+            )
+        self.last_latent_resolution = resolution
         if x.dim() == 4:
             x = x.flatten(1, 2)
         guide_vector = self.guide_extractor(x.transpose(1, 2)).squeeze(-1)
@@ -1222,6 +1292,9 @@ class ImageJSCCDecoder(nn.Module):
         semantic_context: Optional[torch.Tensor] = None,
         multiple_semantic_contexts: Optional[List[torch.Tensor]] = None,
         snr_db: Union[float, torch.Tensor] = 10.0,
+        input_resolution: Optional[Tuple[int, int]] = None,
+        output_resolution: Optional[Tuple[int, int]] = None,
+        output_size: Optional[Tuple[int, int]] = None,
     ) -> torch.Tensor:
         """
         前向传播
@@ -1312,12 +1385,20 @@ class ImageJSCCDecoder(nn.Module):
         else:
             # 仅融合自身引导
             x = x + guide_expanded
+        if input_resolution is None:
+            input_resolution = (
+                self.patches_resolution[0] // (2 ** (self.num_layers - 1)),
+                self.patches_resolution[1] // (2 ** (self.num_layers - 1)),
+            )
+        if output_resolution is None:
+            output_resolution = self.patches_resolution
+        resolution = input_resolution
         for i, layer in enumerate(self.layers):
             if i < len(self.snr_modulators):
                 x = self.snr_modulators[i](x, snr_db)
             if semantic_context is not None and i < len(self.text_modulators):
                 x = self.text_modulators[i](x, text_global)
-            x = layer(x, use_checkpoint=self.training)
+            x, resolution = layer(x, input_resolution=resolution, use_checkpoint=self.training)
         # 4. 将融合后的 x 送入Swin解码器 (无需再注入)
         #for layer in self.layers:
             #x = layer(x, use_checkpoint=self.training)
@@ -1329,7 +1410,7 @@ class ImageJSCCDecoder(nn.Module):
         # 注意：经过解码器层后，特征序列长度应该等于patches_resolution
         # 例如：经过所有层后，最终输出是 [B, 3136, 96]，其中 3136 = 56*56 = patches_resolution
         B, L, C = x.shape
-        H, W = self.patches_resolution[0], self.patches_resolution[1]  # 使用patches_resolution而不是img_size
+        H, W = output_resolution
         
         # 验证：确保 L == H * W（patches_resolution）
         if L != H * W:
@@ -1347,6 +1428,8 @@ class ImageJSCCDecoder(nn.Module):
         
         # 输出投影
         x = self.output_proj(x)
+        if output_size is not None:
+            x = x[..., : output_size[0], : output_size[1]]
         
         # 【优化】将Tanh输出[-1,1]映射到[0,1]，同时增强对比度
         # 使用 (tanh + 1) / 2 进行基本映射，然后应用轻微的对比度增强
