@@ -67,9 +67,7 @@ def _scan_video_ids(video_dir: str) -> Tuple[Dict[str, str], Dict[str, List[str]
         raise FileNotFoundError(f"未找到视频目录: {video_dir}")
     video_ids: Dict[str, str] = {}
     group_map: Dict[str, List[str]] = {}
-    for root, dirs, files in os.walk(video_dir):
-        dirs.sort()
-        files.sort()
+    for root, _, files in os.walk(video_dir):
         rel_dir = os.path.relpath(root, video_dir)
         rel_dir = "" if rel_dir == "." else rel_dir
         group_id = rel_dir.replace(os.sep, "_") if rel_dir else ""
