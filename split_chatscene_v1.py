@@ -62,15 +62,34 @@ def _read_csv_rows(csv_path: str) -> Tuple[List[Dict[str, str]], List[str]]:
     return rows, headers
 
 
+def _normalize_video_id(raw_value: str) -> str:
+    value = raw_value.strip()
+    if not value:
+        return ""
+    value = value.replace("\\", os.sep).replace("/", os.sep)
+    value = os.path.normpath(value)
+    dirname, basename = os.path.split(value)
+    stem, _ = os.path.splitext(basename)
+    if not dirname or dirname == ".":
+        return stem
+    group_id = dirname.replace(os.sep, "_")
+    return f"{group_id}_{stem}"
+
+
 def _scan_video_ids(video_dir: str) -> Tuple[Dict[str, str], Dict[str, List[str]]]:
     if not os.path.isdir(video_dir):
         raise FileNotFoundError(f"未找到视频目录: {video_dir}")
     video_ids: Dict[str, str] = {}
     group_map: Dict[str, List[str]] = {}
+    strip_prefixes = {"video", "videos"}
     for root, _, files in os.walk(video_dir):
         rel_dir = os.path.relpath(root, video_dir)
         rel_dir = "" if rel_dir == "." else rel_dir
-        group_id = rel_dir.replace(os.sep, "_") if rel_dir else ""
+        rel_parts = rel_dir.split(os.sep) if rel_dir else []
+        if rel_parts and rel_parts[0] in strip_prefixes:
+            rel_parts = rel_parts[1:]
+        cleaned_rel_dir = os.sep.join(rel_parts)
+        group_id = cleaned_rel_dir.replace(os.sep, "_") if cleaned_rel_dir else ""
         for fname in files:
             lower = fname.lower()
             if lower.endswith(".mp4") or lower.endswith(".avi"):
@@ -148,7 +167,7 @@ def main() -> None:
 
     csv_video_ids = []
     for row in rows:
-        vid = str(row.get(video_id_col, "")).strip()
+        vid = _normalize_video_id(str(row.get(video_id_col, "")))
         if vid:
             csv_video_ids.append(vid)
 
@@ -179,7 +198,7 @@ def main() -> None:
     if group_active:
         group_map: Dict[str, List[str]] = {}
         for row in rows:
-            vid = str(row.get(video_id_col, "")).strip()
+            vid = _normalize_video_id(str(row.get(video_id_col, "")))
             if vid in video_groups:
                 ids = video_groups[vid]
             elif vid in available_ids:
