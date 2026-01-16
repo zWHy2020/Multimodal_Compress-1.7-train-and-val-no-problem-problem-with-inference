@@ -125,6 +125,66 @@ class LightweightTemporalConv(nn.Module):
         return x, x
 
 
+class ConvLSTMCell(nn.Module):
+    """ConvLSTM 单元"""
+
+    def __init__(self, input_dim: int, hidden_dim: int, kernel_size: int = 3, bias: bool = True):
+        super().__init__()
+        padding = kernel_size // 2
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.conv = nn.Conv2d(
+            input_dim + hidden_dim,
+            4 * hidden_dim,
+            kernel_size=kernel_size,
+            padding=padding,
+            bias=bias,
+        )
+
+    def forward(
+        self,
+        input_tensor: torch.Tensor,
+        state: Tuple[torch.Tensor, torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        h_cur, c_cur = state
+        combined = torch.cat([input_tensor, h_cur], dim=1)
+        conv_output = self.conv(combined)
+        cc_i, cc_f, cc_o, cc_g = torch.chunk(conv_output, 4, dim=1)
+        i = torch.sigmoid(cc_i)
+        f = torch.sigmoid(cc_f)
+        o = torch.sigmoid(cc_o)
+        g = torch.tanh(cc_g)
+        c_next = f * c_cur + i * g
+        h_next = o * torch.tanh(c_next)
+        return h_next, c_next
+
+
+class ConvLSTM(nn.Module):
+    """单层 ConvLSTM"""
+
+    def __init__(self, input_dim: int, hidden_dim: int, kernel_size: int = 3, bias: bool = True):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.cell = ConvLSTMCell(input_dim, hidden_dim, kernel_size, bias)
+
+    def forward(
+        self,
+        input_tensor: torch.Tensor,
+        state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if input_tensor.dim() != 4:
+            raise ValueError(
+                f"ConvLSTM expects [B, C, H, W] input, got {tuple(input_tensor.shape)}"
+            )
+        batch_size, _, height, width = input_tensor.shape
+        if state is None:
+            h = torch.zeros(batch_size, self.hidden_dim, height, width, device=input_tensor.device)
+            c = torch.zeros(batch_size, self.hidden_dim, height, width, device=input_tensor.device)
+            state = (h, c)
+        h_next, c_next = self.cell(input_tensor, state)
+        return h_next, (h_next, c_next)
+
+
 
 
 
@@ -416,15 +476,14 @@ class VideoJSCCEncoder(nn.Module):
         self.feature_reshape = nn.Conv2d(hidden_dim, hidden_dim, kernel_size=1)
         self.snr_modulator = SNRModulator(hidden_dim)
         
-        # 轻量级时序卷积建模（重构：使用LightweightTemporalConv替代ConvLSTM）
+        # ConvLSTM 时序建模
         if use_convlstm:
-            self.temporal_layer = LightweightTemporalConv(  # 实际上是LightweightTemporalConv
+            self.temporal_layer = ConvLSTM(
                 input_dim=hidden_dim,
                 hidden_dim=hidden_dim,
                 kernel_size=3,
-                num_layers=1  # 重构：减少层数以节省显存
             )
-            self.hidden_state = None  # 重构：hidden_state现在是单个tensor而不是list
+            self.hidden_state = None
         
         # 输出投影
         self.output_proj = nn.Sequential(
@@ -460,6 +519,7 @@ class VideoJSCCEncoder(nn.Module):
             Tuple[torch.Tensor, torch.Tensor]: (编码特征, 引导向量)
         """
         B, T, C, H, W = video_frames.shape
+        self.last_input_size = (H, W)
         
         if reset_state or self.hidden_state is None:
             self.hidden_state = None
@@ -497,9 +557,8 @@ class VideoJSCCEncoder(nn.Module):
                 # 计算特征残差
                 feature_residual = current_feature - warped_feature
                 
-                # 轻量级时序卷积传播特征（重构：使用LightweightTemporalConv替代ConvLSTM）
+                # ConvLSTM 时序建模
                 if self.use_convlstm:
-                    # 新的LightweightTemporalConv接受[B, C, H, W]格式，不需要unsqueeze
                     feature_residual, self.hidden_state = self.temporal_layer(
                         feature_residual, self.hidden_state
                     )
@@ -518,7 +577,6 @@ class VideoJSCCEncoder(nn.Module):
             else:
                 # 第一帧或没有光流
                 if self.use_convlstm:
-                    # 新的LightweightTemporalConv接受[B, C, H, W]格式
                     current_feature, self.hidden_state = self.temporal_layer(
                         current_feature, self.hidden_state
                     )
@@ -600,11 +658,21 @@ class VideoJSCCEncoder(nn.Module):
         
         # Patch embedding
         x = self.patch_embed(frame)  # [B, num_patches, hidden_dim]
+        patch_resolution = getattr(self.patch_embed, "grid_size", None)
+        if patch_resolution is None:
+            patch_resolution = (
+                frame.shape[-2] // self.patch_embed.patch_size,
+                frame.shape[-1] // self.patch_embed.patch_size,
+            )
+        self.last_pad = getattr(self.patch_embed, "last_pad", (0, 0))
+        self.last_patch_resolution = patch_resolution
         
         # 通过Swin Transformer层（鲁棒：若维度不兼容则跳过Swin层）
         #try:
+        resolution = patch_resolution
         for layer in self.swin_layers:
-            x = layer(x)
+            x, resolution = layer(x, input_resolution=resolution)
+        self.last_latent_resolution = resolution
         #except Exception as e:
             #print(f"[Warn] VideoJSCCEncoder.swin_layers 失败，启用简化路径: {e}; x.shape={tuple(x.shape)}")
         
@@ -619,10 +687,11 @@ class VideoJSCCEncoder(nn.Module):
         num_patches = x.shape[1]
         #patch_size = int(num_patches ** 0.5)
         #x = x.view(B, patch_size, patch_size, -1).permute(0, 3, 1, 2)  # [B, hidden_dim, H', W']
-        H, W = frame.shape[-2:]
-        feat_h = H // self.patch_embed.patch_size
-        feat_w = W // self.patch_embed.patch_size
-        assert num_patches == feat_h * feat_w, f"特征序列长度 {num_patches} 与计算出的网格 {feat_h}x{feat_w} 不匹配"
+        feat_h, feat_w = resolution
+        if num_patches != feat_h * feat_w:
+            raise RuntimeError(
+                f"特征序列长度 {num_patches} 与计算出的网格 {feat_h}x{feat_w} 不匹配"
+            )
         x = x.view(B, feat_h, feat_w, -1).permute(0, 3, 1, 2)
         # 特征重塑
         x = self.feature_reshape(x)
@@ -741,15 +810,14 @@ class VideoJSCCDecoder(nn.Module):
             nn.Sigmoid()  # 添加 Sigmoid 激活函数，确保输出在 [0, 1] 范围内
         )
         
-        # 轻量级时序卷积建模（重构：使用LightweightTemporalConv替代ConvLSTM）
+        # ConvLSTM 时序建模
         if use_convlstm:
-            self.temporal_layer = LightweightTemporalConv(  # 实际上是LightweightTemporalConv
+            self.temporal_layer = ConvLSTM(
                 input_dim=hidden_dim,
                 hidden_dim=hidden_dim,
                 kernel_size=3,
-                num_layers=1  # 重构：减少层数以节省显存
             )
-            self.hidden_state = None  # 重构：hidden_state现在是单个tensor而不是list
+            self.hidden_state = None
         
         # 光流估计（用于解码端）
         if use_optical_flow:
@@ -794,7 +862,8 @@ class VideoJSCCDecoder(nn.Module):
         noisy_features: torch.Tensor,
         guide_vectors: torch.Tensor,
         reset_state: bool = False,
-        semantic_context: Optional[torch.Tensor] = None
+        semantic_context: Optional[torch.Tensor] = None,
+        output_size: Optional[Tuple[int, int]] = None,
     ) -> torch.Tensor:
         """
         视频解码器前向传播 - 特征空间运动补偿
@@ -844,10 +913,9 @@ class VideoJSCCDecoder(nn.Module):
                 projected_features = projected_features + guide_expanded
             del guide_expanded  # 及时释放
             
-            # 轻量级时序卷积建模（重构：使用LightweightTemporalConv替代ConvLSTM）
+            # ConvLSTM 时序建模
             # 注意：语义引导已在convlstm之前应用，确保所有时序和语义信息在进入convlstm之前都已就位
             if self.use_convlstm:
-                # 新的LightweightTemporalConv接受[B, C, H, W]格式
                 projected_features, self.hidden_state = self.temporal_layer(
                     projected_features, self.hidden_state
                 )
@@ -856,7 +924,9 @@ class VideoJSCCDecoder(nn.Module):
             if self.use_optical_flow and t > 0 and prev_reconstructed_feature is not None:
                 # 估计光流（在像素空间）
                 # 优化：先解码 projected_features 得到预览帧用于光流估计
-                preliminary_current_frame = self._decode_swin_features(projected_features)
+                preliminary_current_frame = self._decode_swin_features(
+                    projected_features, output_size=output_size
+                )
                 flow = self.optical_flow(prev_decoded_frame, preliminary_current_frame)
                 
                 # 将像素空间光流对齐到特征空间尺寸，并按比例缩放位移
@@ -893,11 +963,15 @@ class VideoJSCCDecoder(nn.Module):
                 else:
                     # 差异较大，说明运动补偿有明显效果，需要重新解码以保持精度
                     del preliminary_current_frame  # 释放预览帧
-                    decoded_frame = self._decode_swin_features(current_reconstructed_feature)
+                    decoded_frame = self._decode_swin_features(
+                        current_reconstructed_feature, output_size=output_size
+                    )
             else:
                 # 第一帧或没有光流：直接解码
                 current_reconstructed_feature = projected_features
-                decoded_frame = self._decode_swin_features(current_reconstructed_feature)
+                decoded_frame = self._decode_swin_features(
+                    current_reconstructed_feature, output_size=output_size
+                )
             
             # 修复OOM：将解码帧移到CPU，最后再移回GPU（减少GPU峰值内存）
             # 保存解码帧（先移到CPU以节省GPU内存）
@@ -968,7 +1042,11 @@ class VideoJSCCDecoder(nn.Module):
         
         return warped_features
     
-    def _decode_swin_features(self, features: torch.Tensor) -> torch.Tensor:
+    def _decode_swin_features(
+        self,
+        features: torch.Tensor,
+        output_size: Optional[Tuple[int, int]] = None,
+    ) -> torch.Tensor:
         """
         使用Swin Transformer解码特征
         
@@ -987,37 +1065,26 @@ class VideoJSCCDecoder(nn.Module):
         x = x.view(B, C, -1).transpose(1, 2)  # [B, H*W, C]
         
         # 通过Swin Transformer层（包含上采样）
-        # 修复OOM：在每层之间清理GPU缓存，减少内存碎片
+        resolution = (H, W)
         for i, layer in enumerate(self.swin_layers):
-            x = layer(x, use_checkpoint=self.training)  # 确保使用梯度检查点
+            x, resolution = layer(x, input_resolution=resolution, use_checkpoint=self.training)
         
         # 重塑为特征图格式
         # 经过 PatchReverseMerging 上采样后，特征图尺寸应为原始图像的尺寸
         # 例如：从 56×56 -> 112×112 -> 224×224
         num_patches = x.shape[1]
-        
-        # 直接使用 img_size 来确定输出尺寸（简化逻辑，去除复杂的推断代码）
-        # 经过3层Swin层上采样后，分辨率应为：patches_resolution × 4 = img_size
-        # 第1层：56×56 -> 56×56（不上采样）
-        # 第2层：56×56 -> 112×112（上采样2倍）
-        # 第3层：112×112 -> 224×224（上采样2倍）
-        # 总上采样倍数：2 × 2 = 4倍
-        h, w = self.img_size[0], self.img_size[1]
-        
-        # 断言：确保 num_patches == h * w（验证上采样逻辑的正确性）
-        # 如果断言失败，说明上采样配置有误，应立即报错而不是试图"修复"
-        assert num_patches == h * w, (
-            f"VideoJSCCDecoder上采样维度不匹配："
-            f"num_patches={num_patches}, img_size={self.img_size}, h*w={h*w}。"
-            f"经过上采样后，num_patches应该等于img_size的乘积。"
-            f"请检查上采样配置：patches_resolution={self.patches_resolution}, "
-            f"预期最终分辨率应为 {self.patches_resolution[0]*4}×{self.patches_resolution[1]*4}。"
-        )
-        
+        h, w = resolution
+        if num_patches != h * w:
+            raise RuntimeError(
+                "VideoJSCCDecoder上采样维度不匹配："
+                f"num_patches={num_patches}, resolution={resolution}, h*w={h*w}。"
+            )
         x = x.view(B, h, w, -1).permute(0, 3, 1, 2)  # [B, hidden_dim, H', W']
         
         # 输出投影（通道映射 + Sigmoid）
         x = self.output_proj(x)
+        if output_size is not None:
+            x = x[..., : output_size[0], : output_size[1]]
         
         return x
     

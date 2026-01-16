@@ -63,7 +63,7 @@ class TrainingConfig:
         self.temporal_consistency_weight = 0.02  # 【新增】视频时序一致性正则权重
         # 文本引导与条件约束（路线1默认）
         self.use_text_guidance_image = False
-        self.use_text_guidance_video = True
+        self.use_text_guidance_video = False
         self.enforce_text_condition = True
         self.condition_margin_weight = 0.1
         self.condition_margin = 0.05
@@ -76,6 +76,12 @@ class TrainingConfig:
         self.train_snr_max = 15.0
         self.train_snr_random = False # 是否随机SNR
         self.snr_db = 10.0
+
+        # 带宽/码率调度（通道门控）
+        self.bandwidth_ratio_start = 1.0
+        self.bandwidth_ratio_end = 0.5
+        self.bandwidth_warmup_epochs = 5
+        self.bandwidth_anneal_epochs = 20
         # 模型参数
         self.vocab_size = 65536
         self.text_embed_dim = 512
@@ -95,9 +101,13 @@ class TrainingConfig:
         
         self.video_hidden_dim = 384
         self.video_num_frames = 5
-        self.video_use_optical_flow = False  # 重构：默认禁用光流以节省显存，使用轻量级替代
-        self.video_use_convlstm = False  # 重构：默认禁用ConvLSTM以节省显存，使用轻量级时序卷积
+        self.video_use_optical_flow = True  # 默认启用光流用于时序对齐
+        self.video_use_convlstm = True  # 默认启用ConvLSTM建模时序
         self.video_output_dim = 256
+        self.video_decoder_type = "unet"
+        self.video_unet_base_channels = 64
+        self.video_unet_num_down = 4
+        self.video_unet_num_res_blocks = 3
         
         self.channel_type = "awgn"
       
@@ -108,6 +118,10 @@ class TrainingConfig:
         self.val_manifest = None
         self.max_text_length = 512
         self.max_video_frames = 3
+        self.video_clip_len = self.max_video_frames
+        self.video_stride = 1
+        self.video_sampling_strategy = "contiguous_clip"
+        self.video_eval_sampling_strategy = "uniform"
         self.max_samples = 65536  # 【Phase 4】默认最大样本数
         self.allow_missing_modalities = False
         self.strict_data_loading = True
@@ -119,7 +133,12 @@ class TrainingConfig:
         
         # 【Phase 3】对抗训练参数
         self.use_adversarial = False  # 是否使用对抗训练（默认关闭，需要时可启用）
-        self.discriminator_weight = 0.01  # 【Phase 4】对抗损失权重（默认较小）
+        self.gan_enable_epoch = 5  # 【Phase 6】GAN warmup: 前N个epoch只做重建
+        self.d_updates_per_g = 1  # 【Phase 6】判别器更新频率（每次生成器更新对应的D更新次数）
+        self.gan_weight = 0.01  # 【Phase 6】对抗损失权重（默认较小）
+        self.discriminator_weight = self.gan_weight  # 兼容旧字段
+        self.use_r1_regularization = False  # 【Phase 6】可选R1正则
+        self.r1_gamma = 10.0  # 【Phase 6】R1正则强度
         self.ddp_find_unused_parameters = True  # DDP下允许未使用参数（用于缺失模态场景）
         self.use_quantization_noise = True  # 【新增】是否启用量化噪声模拟
         self.quantization_noise_range = 0.5  # 【新增】量化噪声范围（均匀分布 [-r, r]）
@@ -129,6 +148,13 @@ class TrainingConfig:
         log_func(f"Image Embed Dims: {self.img_embed_dims}")
         log_func(f"Image Depths: {self.img_depths}")
         log_func(f"Use Adversarial: {getattr(self, 'use_adversarial', False)}")
+        log_func(
+            "Video sampling: clip_len="
+            f"{getattr(self, 'video_clip_len', None)} stride="
+            f"{getattr(self, 'video_stride', None)} train_strategy="
+            f"{getattr(self, 'video_sampling_strategy', None)} eval_strategy="
+            f"{getattr(self, 'video_eval_sampling_strategy', None)}"
+        )
         log_func("=========================================\n")
 
 
@@ -160,6 +186,10 @@ class EvaluationConfig:
         # SNR和Rate列表
         self.snr_list = [-5, -10, -5, 0, 5, 10, 15, 20]
         self.rate_list = None  # Rate列表（如果模型支持），None表示使用默认rate
+        self.snr_db = 10.0
+        self.snr_random = False
+        self.snr_min = -5.0
+        self.snr_max = 15.0
         
         # Patch-based推理设置（用于处理任意尺寸图像）
         self.use_patch_inference = True
@@ -178,6 +208,13 @@ class EvaluationConfig:
         self.image_size = (256, 256)
         self.max_text_length = 512
         self.max_video_frames = 10
+        self.video_clip_len = self.max_video_frames
+        self.video_stride = 1
+        self.video_sampling_strategy = "contiguous_clip"
+        self.video_eval_sampling_strategy = "uniform"
+        self.infer_window_len = None
+        self.infer_window_stride = None
+        self.max_output_frames = None
         
         # 模型参数（用于加载模型时，通常从检查点恢复）
         self.vocab_size = 10000
@@ -198,15 +235,19 @@ class EvaluationConfig:
         
         self.video_hidden_dim = 256
         self.video_num_frames = 3
-        self.video_use_optical_flow = False  # 重构：默认禁用光流以节省显存
-        self.video_use_convlstm = False  # 重构：默认禁用ConvLSTM以节省显存
+        self.video_use_optical_flow = True  # 推理侧默认启用光流
+        self.video_use_convlstm = True  # 推理侧默认启用ConvLSTM
         self.video_output_dim = 256
+        self.video_decoder_type = "unet"
+        self.video_unet_base_channels = 64
+        self.video_unet_num_down = 4
+        self.video_unet_num_res_blocks = 3
+        self.use_amp = False  # 推理是否启用混合精度
         
         self.channel_type = "awgn"
-        self.snr_db = 10.0
         # 文本引导与条件约束（评估侧保持与训练一致的开关）
         self.use_text_guidance_image = False
-        self.use_text_guidance_video = True
+        self.use_text_guidance_video = False
         self.enforce_text_condition = True
         self.condition_prob = 0.0  # 评估默认不触发额外 condition-margin 计算
         self.condition_margin = 0.05

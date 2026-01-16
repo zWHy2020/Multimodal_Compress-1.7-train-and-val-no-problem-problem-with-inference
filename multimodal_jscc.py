@@ -14,8 +14,54 @@ import math
 from text_encoder import TextJSCCEncoder, TextJSCCDecoder
 from image_encoder import ImageJSCCEncoder, ImageJSCCDecoder
 from video_encoder import VideoJSCCEncoder, VideoJSCCDecoder
+from video_unet import VideoUNetDecoder
 from cross_attention import MultiModalCrossAttention
 from channel import Channel
+
+
+class BandwidthMask(nn.Module):
+    """基于带宽比例的通道门控（不改变张量形状）。"""
+
+    def __init__(self, ratio: float = 1.0):
+        super().__init__()
+        self.ratio = float(ratio)
+
+    def set_ratio(self, ratio: float) -> None:
+        self.ratio = float(ratio)
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        if features is None:
+            return features
+        ratio = float(self.ratio) if self.ratio is not None else 1.0
+        ratio = max(0.0, min(1.0, ratio))
+        if ratio >= 1.0:
+            return features
+
+        if features.dim() == 5:
+            channel_dim = 2  # [B, T, C, H, W]
+        elif features.dim() == 4:
+            channel_dim = 1  # [B, C, H, W]
+        elif features.dim() == 3:
+            channel_dim = 2  # [B, L, C]
+        else:
+            return features
+
+        channels = features.size(channel_dim)
+        if ratio <= 0.0 or channels == 0:
+            return torch.zeros_like(features)
+
+        kept = int(math.ceil(channels * ratio))
+        kept = max(1, min(channels, kept))
+        mask = torch.zeros(channels, device=features.device, dtype=features.dtype)
+        mask[:kept] = 1.0
+
+        if features.dim() == 5:
+            mask = mask.view(1, 1, channels, 1, 1)
+        elif features.dim() == 4:
+            mask = mask.view(1, channels, 1, 1)
+        else:
+            mask = mask.view(1, 1, channels)
+        return features * mask
 
 
 class MultimodalJSCC(nn.Module):
@@ -55,6 +101,10 @@ class MultimodalJSCC(nn.Module):
         video_use_optical_flow: bool = True,
         video_use_convlstm: bool = True,
         video_output_dim: int = 256,
+        video_decoder_type: str = "unet",
+        video_unet_base_channels: int = 64,
+        video_unet_num_down: int = 4,
+        video_unet_num_res_blocks: int = 3,
         
         # 信道参数
         channel_type: str = "awgn",
@@ -63,7 +113,7 @@ class MultimodalJSCC(nn.Module):
         use_quantization_noise: bool = False,
         quantization_noise_range: float = 0.5,
         use_text_guidance_image: bool = False,
-        use_text_guidance_video: bool = True,
+        use_text_guidance_video: bool = False,
         enforce_text_condition: bool = True,
         condition_margin_weight: float = 0.1,
         condition_margin: float = 0.05,
@@ -138,16 +188,26 @@ class MultimodalJSCC(nn.Module):
             patch_size=patch_size
             # 不传入 patch_embed, swin_layers, swin_norm，让编码器使用独立路径
         )
-        self.video_decoder = VideoJSCCDecoder(
-            hidden_dim=video_hidden_dim,
-            num_frames=video_num_frames,
-            use_optical_flow=video_use_optical_flow,
-            use_convlstm=video_use_convlstm,
-            input_dim=video_output_dim,
-            img_size=img_size,  # 添加图像尺寸参数，用于上采样
-            patch_size=patch_size,  # 添加 patch 大小参数，用于上采样
-            semantic_context_dim=text_output_dim  # 添加语义上下文维度，用于语义对齐层
-        )
+        if video_decoder_type.lower() == "swin":
+            self.video_decoder = VideoJSCCDecoder(
+                hidden_dim=video_hidden_dim,
+                num_frames=video_num_frames,
+                use_optical_flow=video_use_optical_flow,
+                use_convlstm=video_use_convlstm,
+                input_dim=video_output_dim,
+                img_size=img_size,  # 添加图像尺寸参数，用于上采样
+                patch_size=patch_size,  # 添加 patch 大小参数，用于上采样
+                semantic_context_dim=text_output_dim  # 添加语义上下文维度，用于语义对齐层
+            )
+        else:
+            self.video_decoder = VideoUNetDecoder(
+                in_channels=video_output_dim,
+                out_channels=3,
+                base_channels=video_unet_base_channels,
+                num_down=video_unet_num_down,
+                num_res_blocks=video_unet_num_res_blocks,
+                use_sigmoid=True,
+            )
         
         # 信道模型
         self.channel = Channel(
@@ -165,6 +225,8 @@ class MultimodalJSCC(nn.Module):
         self.condition_prob = condition_prob
         self.condition_only_low_snr = condition_only_low_snr
         self.condition_low_snr_threshold = condition_low_snr_threshold
+        self.bandwidth_ratio = 1.0
+        self.bandwidth_mask = BandwidthMask(self.bandwidth_ratio)
         
         # 功率归一化模块（可选）
         # 始终创建属性以便在评估/推理阶段安全访问
@@ -233,12 +295,6 @@ class MultimodalJSCC(nn.Module):
                 f"图像输入应为4D张量 [B, C, H, W]，实际为 {image_input.dim()}D，shape={tuple(image_input.shape)}"
             )
             expected_img_hw = None
-            if hasattr(self.image_encoder, 'patch_embed') and hasattr(self.image_encoder.patch_embed, 'img_size'):
-                expected_img_hw = tuple(self.image_encoder.patch_embed.img_size)
-            if expected_img_hw is not None:
-                assert tuple(image_input.shape[-2:]) == expected_img_hw, (
-                    f"图像输入空间尺寸不匹配: got HxW={tuple(image_input.shape[-2:])}, expected={expected_img_hw}"
-                )
             
             # 调用编码器
             image_encoded, image_guide = self.image_encoder(image_input, snr_db=snr_db)
@@ -273,6 +329,7 @@ class MultimodalJSCC(nn.Module):
         # 视频编码
         if video_input is not None:
             video_encoded, video_guide = self.video_encoder(video_input, snr_db=snr_db)
+            video_encoded = self.bandwidth_mask(video_encoded)
             # 验证输出维度
             #expected_video_dim = getattr(self.power_normalizer['video'], 'normalized_shape', (None,))
             #expected_video_dim = expected_video_dim[0] if isinstance(expected_video_dim, (list, tuple)) else expected_video_dim
@@ -284,6 +341,7 @@ class MultimodalJSCC(nn.Module):
             guide_vectors['video'] = video_guide
             results['video_encoded'] = video_encoded
             results['video_guide'] = video_guide
+        results['bandwidth_ratio'] = self.bandwidth_ratio
         
         # 功率归一化
         #for modality in encoded_features:
@@ -329,7 +387,10 @@ class MultimodalJSCC(nn.Module):
                 transmitted_features['image'],
                 guide_vectors['image'],
                 semantic_context=semantic_for_image,  # 路线1默认禁用 text->image
-                snr_db=snr_db
+                snr_db=snr_db,
+                input_resolution=getattr(self.image_encoder, "last_latent_resolution", None),
+                output_resolution=getattr(self.image_encoder, "last_patch_resolution", None),
+                output_size=getattr(self.image_encoder, "last_input_size", None),
             )
             decoded_outputs['image'] = image_decoded
             results['image_decoded'] = image_decoded
@@ -342,7 +403,8 @@ class MultimodalJSCC(nn.Module):
             video_decoded = self.video_decoder(
                 transmitted_features['video'],
                 guide_vectors['video'],
-                semantic_context=semantic_for_video  # 使用原始文本编码（未归一化）作为语义上下文
+                semantic_context=semantic_for_video,  # None 时视频解码不会走语义 cross-attention
+                output_size=getattr(self.video_encoder, "last_input_size", None),
             )
             decoded_outputs['video'] = video_decoded
             results['video_decoded'] = video_decoded
@@ -445,6 +507,7 @@ class MultimodalJSCC(nn.Module):
         # 视频编码
         if video_input is not None:
             video_encoded, video_guide = self.video_encoder(video_input, snr_db=snr_db)
+            video_encoded = self.bandwidth_mask(video_encoded)
             results['video_encoded'] = video_encoded
             results['video_guide'] = video_guide
         
@@ -503,7 +566,7 @@ class MultimodalJSCC(nn.Module):
             video_decoded = self.video_decoder(
                 transmitted_features['video'],
                 guide_vectors['video'],
-                semantic_context=semantic_for_video,  # 传递语义上下文
+                semantic_context=semantic_for_video,  # None 时视频解码不会走语义 cross-attention
                 multiple_semantic_contexts=multiple_semantic_contexts
             )
             results['video_decoded'] = video_decoded
@@ -517,6 +580,11 @@ class MultimodalJSCC(nn.Module):
     def set_snr(self, snr_db: float):
         """设置信噪比"""
         self.channel.set_snr(snr_db)
+
+    def set_bandwidth_ratio(self, ratio: float):
+        """设置带宽门控比例"""
+        self.bandwidth_ratio = float(ratio)
+        self.bandwidth_mask.set_ratio(self.bandwidth_ratio)
     
     def reset_hidden_states(self):
         """重置所有隐藏状态"""

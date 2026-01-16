@@ -21,7 +21,7 @@ from multimodal_jscc import MultimodalJSCC
 from config import EvaluationConfig
 from utils import (
     seed_torch, logger_configuration, makedirs,
-    split_image_v2, merge_image_v2, split_video_v2, merge_video_v2
+    split_image_v2, merge_image_v2
 )
 from torchvision import transforms
 from utils_check import print_model_structure_info, check_state_dict_compatibility
@@ -53,23 +53,24 @@ def crop_image(image: torch.Tensor, pad_h: int, pad_w: int) -> torch.Tensor:
         return image[:, :H - pad_h, :W - pad_w]
     raise ValueError(f"Unsupported image shape for cropping: {image.shape}")
 
-def load_image(image_path: str) -> torch.Tensor:
+def load_image(image_path: str, normalize: bool = False) -> torch.Tensor:
     """
     加载图像并转换为tensor
     
     Args:
         image_path: 图像文件路径
+        normalize: 是否使用ImageNet归一化
     
     Returns:
-        torch.Tensor: [C, H, W]，ImageNet归一化的图像
+        torch.Tensor: [C, H, W] 图像
     """
     image = Image.open(image_path).convert('RGB')
     
-    # ImageNet归一化
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
-    ])
+    transform_steps = [transforms.ToTensor()]
+    if normalize:
+        # ImageNet归一化
+        transform_steps.append(transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD))
+    transform = transforms.Compose(transform_steps)
     
     image_tensor = transform(image)
     return image_tensor
@@ -89,16 +90,17 @@ def load_text(text_path: str) -> str:
         return f.read().strip()
 
 
-def load_video(video_path: str, max_frames: int = 10) -> torch.Tensor:
+def load_video(video_path: str, max_frames: Optional[int] = None, normalize: bool = False) -> torch.Tensor:
     """
     加载视频并转换为tensor
     
     Args:
         video_path: 视频文件路径
-        max_frames: 最大帧数
+        max_frames: 最大帧数，None 表示读取全帧
+        normalize: 是否使用ImageNet归一化
     
     Returns:
-        torch.Tensor: [T, C, H, W]，ImageNet归一化的视频帧
+        torch.Tensor: [T, C, H, W] 视频帧
     """
     cap = cv2.VideoCapture(video_path)
     frames = []
@@ -115,21 +117,21 @@ def load_video(video_path: str, max_frames: int = 10) -> torch.Tensor:
     cap.release()
     
     # 限制帧数
-    if len(frames) > max_frames:
+    if max_frames is not None and len(frames) > max_frames:
         indices = np.linspace(0, len(frames) - 1, max_frames, dtype=int)
         frames = [frames[i] for i in indices]
     
-    # ImageNet归一化
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
-    ])
+    transform_steps = [transforms.ToTensor()]
+    if normalize:
+        # ImageNet归一化
+        transform_steps.append(transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD))
+    transform = transforms.Compose(transform_steps)
     
     video_tensor = torch.stack([transform(frame) for frame in frames])
     return video_tensor
 
 
-def denormalize_image(image_tensor: torch.Tensor) -> np.ndarray:
+def denormalize_image(image_tensor: torch.Tensor, normalized: bool = True) -> np.ndarray:
     """
     将ImageNet归一化的图像tensor转换回可显示的图像
     
@@ -141,17 +143,18 @@ def denormalize_image(image_tensor: torch.Tensor) -> np.ndarray:
     """
     if image_tensor.dim() == 4:
         image_tensor = image_tensor[0]  # [B, C, H, W] -> [C, H, W]
-    mean = torch.tensor(IMAGENET_MEAN, device=image_tensor.device).view(3, 1, 1)
-    std = torch.tensor(IMAGENET_STD, device=image_tensor.device).view(3, 1, 1)
-    image_tensor = image_tensor * std + mean
+    if normalized:
+        mean = torch.tensor(IMAGENET_MEAN, device=image_tensor.device).view(3, 1, 1)
+        std = torch.tensor(IMAGENET_STD, device=image_tensor.device).view(3, 1, 1)
+        image_tensor = image_tensor * std + mean
     
     image_tensor = torch.clamp(image_tensor, 0, 1)
     image_np = (image_tensor.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
     return image_np
 
 
-def denormalize_video_frame(frame_tensor: torch.Tensor) -> np.ndarray:
-    frame = denormalize_image(frame_tensor)
+def denormalize_video_frame(frame_tensor: torch.Tensor, normalized: bool = True) -> np.ndarray:
+    frame = denormalize_image(frame_tensor, normalized=normalized)
     return cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
 
@@ -164,6 +167,143 @@ def get_video_fps(video_path: str, default_fps: float) -> float:
     if fps and fps > 0:
         return fps
     return default_fps
+
+
+def get_video_meta(video_path: str) -> Dict[str, float]:
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return {
+            "width": 0,
+            "height": 0,
+            "fps": 0.0,
+            "frame_count": 0,
+            "duration": 0.0,
+        }
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    cap.release()
+    duration = frame_count / fps if fps and fps > 0 else 0.0
+    return {
+        "width": width,
+        "height": height,
+        "fps": fps if fps else 0.0,
+        "frame_count": frame_count,
+        "duration": duration,
+    }
+
+
+def resolve_infer_window(config: EvaluationConfig) -> Tuple[int, int]:
+    window_len = (
+        config.infer_window_len
+        if getattr(config, "infer_window_len", None)
+        else getattr(config, "video_clip_len", None)
+    )
+    if not window_len:
+        window_len = getattr(config, "max_video_frames", 10)
+    stride = (
+        config.infer_window_stride
+        if getattr(config, "infer_window_stride", None)
+        else getattr(config, "video_stride", None)
+    )
+    if not stride:
+        stride = window_len
+    if window_len <= 0 or stride <= 0:
+        raise ValueError(f"无效滑窗参数: window_len={window_len}, stride={stride}")
+    return window_len, stride
+
+
+def reconstruct_video_clip(
+    model: MultimodalJSCC,
+    video_clip: torch.Tensor,
+    config: EvaluationConfig,
+    device: torch.device,
+    logger: logging.Logger,
+    use_amp: bool,
+) -> Tuple[torch.Tensor, str]:
+    original_shape = video_clip.shape
+    patch_size = getattr(config, "patch_size", None)
+    if patch_size is None and hasattr(model, "image_encoder") and hasattr(model.image_encoder, "patch_embed"):
+        patch_size = getattr(model.image_encoder.patch_embed, "patch_size", 128)
+    patch_size = patch_size or 128
+    pad_multiple = patch_size
+    padded_video, pad_h, pad_w = pad_image(video_clip, pad_multiple)
+    need_patch = config.use_patch_inference and (
+        original_shape[2] > patch_size or original_shape[3] > patch_size
+    )
+    if need_patch:
+        path_used = "clip-patch-video"
+        patches, meta = split_video_clip_patches(padded_video, patch_size, config.patch_overlap)
+        patch_results_list = []
+        patch_batch_size = 2
+        for i in range(0, len(patches), patch_batch_size):
+            patch_batch = patches[i : i + patch_batch_size].to(device)
+            with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+                results = model(video_input=patch_batch, snr_db=config.snr_db)
+            patch_decoded_video = results["video_decoded"]
+            patch_results_list.append(patch_decoded_video.cpu())
+            del patch_batch, results, patch_decoded_video
+            if (i // patch_batch_size + 1) % 5 == 0:
+                torch.cuda.empty_cache()
+        reconstructed_patches = torch.cat(patch_results_list, dim=0)
+        del patch_results_list, patches
+        torch.cuda.empty_cache()
+        reconstructed_video = merge_video_clip_patches(reconstructed_patches, meta)
+        reconstructed_video = crop_image(reconstructed_video, pad_h, pad_w)
+    else:
+        path_used = "standard"
+        video_input = padded_video.unsqueeze(0).to(device)
+        with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+            results = model(video_input=video_input, snr_db=config.snr_db)
+        reconstructed_video = results["video_decoded"]
+        if reconstructed_video.dim() == 5:
+            reconstructed_video = reconstructed_video.squeeze(0)
+        reconstructed_video = crop_image(reconstructed_video, pad_h, pad_w)
+    if reconstructed_video.shape != original_shape:
+        logger.warning(
+            "重建视频尺寸不一致: original=%s reconstructed=%s",
+            original_shape,
+            reconstructed_video.shape,
+        )
+    return reconstructed_video, path_used
+
+
+def sliding_window_reconstruct(
+    model: MultimodalJSCC,
+    video_full: torch.Tensor,
+    config: EvaluationConfig,
+    device: torch.device,
+    logger: logging.Logger,
+    use_amp: bool,
+    window_len: int,
+    stride: int,
+) -> Tuple[torch.Tensor, str]:
+    total_frames = video_full.shape[0]
+    accum = torch.zeros_like(video_full, dtype=torch.float32, device=device)
+    counts = torch.zeros((total_frames, 1, 1, 1), dtype=torch.float32, device=device)
+    path_used = "sliding-window"
+    for start in range(0, total_frames, stride):
+        end = min(start + window_len, total_frames)
+        window = video_full[start:end]
+        valid_len = window.shape[0]
+        if valid_len < window_len:
+            pad_frames = window[-1:].repeat(window_len - valid_len, 1, 1, 1)
+            window = torch.cat([window, pad_frames], dim=0)
+        reconstructed_window, path_used = reconstruct_video_clip(
+            model=model,
+            video_clip=window,
+            config=config,
+            device=device,
+            logger=logger,
+            use_amp=use_amp,
+        )
+        reconstructed_window = reconstructed_window[:valid_len].to(device)
+        accum[start:end] += reconstructed_window
+        counts[start:end] += 1.0
+    counts = torch.clamp(counts, min=1.0)
+    final_video = accum / counts
+    return final_video, path_used
 
 
 def register_branch_hooks(model: MultimodalJSCC) -> Tuple[Dict[str, int], List[Any]]:
@@ -189,6 +329,57 @@ def register_branch_hooks(model: MultimodalJSCC) -> Tuple[Dict[str, int], List[A
     if hasattr(model, "video_decoder"):
         handles.append(model.video_decoder.register_forward_hook(make_hook("video_decoder")))
     return counters, handles
+
+
+def pad_video_patch(patch: torch.Tensor, patch_size: int) -> torch.Tensor:
+    h, w = patch.shape[-2], patch.shape[-1]
+    pad_h = patch_size - h
+    pad_w = patch_size - w
+    if pad_h > 0:
+        if pad_h < h:
+            patch = F.pad(patch, (0, 0, 0, pad_h), mode="reflect")
+        else:
+            patch = F.pad(patch, (0, 0, 0, pad_h), mode="replicate")
+    if pad_w > 0:
+        current_w = patch.shape[-1]
+        if pad_w < current_w:
+            patch = F.pad(patch, (0, pad_w, 0, 0), mode="reflect")
+        else:
+            patch = F.pad(patch, (0, pad_w, 0, 0), mode="replicate")
+    return patch
+
+
+def split_video_clip_patches(
+    video: torch.Tensor,
+    patch_size: int,
+    overlap: int,
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    first_frame = video[0]
+    _, meta = split_image_v2(first_frame, patch_size, overlap)
+    patches = []
+    for pos in meta["positions"]:
+        y, x = pos["y"], pos["x"]
+        y_end, x_end = pos["y_end"], pos["x_end"]
+        patch = video[:, :, y:y_end, x:x_end]
+        patch = pad_video_patch(patch, patch_size)
+        patches.append(patch)
+    patches_tensor = torch.stack(patches, dim=0)
+    return patches_tensor, meta
+
+
+def merge_video_clip_patches(
+    patches: torch.Tensor,
+    meta: Dict[str, Any],
+) -> torch.Tensor:
+    frame_count = patches.shape[1]
+    reconstructed_frames = []
+    for t in range(frame_count):
+        frame_patches = patches[:, t]
+        frame = merge_image_v2(frame_patches, meta)
+        if frame.dim() == 4:
+            frame = frame.squeeze(0)
+        reconstructed_frames.append(frame)
+    return torch.stack(reconstructed_frames, dim=0)
  
     #image_tensor = torch.clamp(image_tensor, 0, 1)
     
@@ -204,7 +395,8 @@ def infer_image(
     logger: logging.Logger,
     text_input: Optional[str] = None,
     text_attention_mask: Optional[torch.Tensor] = None,
-    multiple_text_inputs: Optional[List[str]] = None
+    multiple_text_inputs: Optional[List[str]] = None,
+    normalize: bool = False,
 ) -> Dict[str, Any]:
     """
     对单张图像进行推理
@@ -220,7 +412,7 @@ def infer_image(
         Dict[str, Any]: 推理结果
     """
     logger.info(f"加载图像: {image_path}")
-    image = load_image(image_path)  # [C, H, W]
+    image = load_image(image_path, normalize=normalize)  # [C, H, W]
     original_shape = image.shape[1:]
     
     logger.info(f"图像尺寸: {original_shape[0]}x{original_shape[1]}")
@@ -282,25 +474,29 @@ def infer_image(
     model.eval()
     with torch.no_grad():
         # 检查是否需要patch推理
-        expected_h, expected_w = (224, 224)  # 默认值
-        if hasattr(model, 'image_encoder') and hasattr(model.image_encoder, 'patch_embed'):
-            if hasattr(model.image_encoder.patch_embed, 'img_size'):
-                expected_h, expected_w = model.image_encoder.patch_embed.img_size
+        patch_size = getattr(config, "patch_size", None)
+        if patch_size is None and hasattr(model, "image_encoder") and hasattr(model.image_encoder, "patch_embed"):
+            patch_size = getattr(model.image_encoder.patch_embed, "patch_size", 128)
+        patch_size = patch_size or 128
+        need_patch = config.use_patch_inference and (
+            original_shape[0] > patch_size or original_shape[1] > patch_size
+        )
         
-        need_patch = (original_shape[0] != expected_h or original_shape[1] != expected_w)
-        
-        if need_patch and config.use_patch_inference:
-            pad_multiple = expected_h
+        if need_patch:
+            pad_multiple = patch_size
             padded_image, pad_h, pad_w = pad_image(image, pad_multiple)
             logger.info(f"使用 patch-based 推理（patch_size={config.patch_size}, overlap={config.patch_overlap}）")
             
             # 分割图像
             #patches, meta = split_image_v2(image, config.patch_size, config.patch_overlap)
             #patches, meta = split_image_v2(image, expected_h, config.patch_overlap)
-            patches, meta = split_image_v2(padded_image, expected_h, config.patch_overlap) # <--- 替换为这行
-            logger.info(f"使用 patch-based 推理（patch_size={expected_h}, overlap={config.patch_overlap}）")
+            patches, meta = split_image_v2(padded_image, patch_size, config.patch_overlap)
+            logger.info(f"使用 patch-based 推理（patch_size={patch_size}, overlap={config.patch_overlap}）")
             patches = patches.to(device)
-            global_input = transforms.functional.resize(image, (expected_h, expected_w))
+            if max(original_shape) > patch_size:
+                global_input = transforms.functional.resize(image, (patch_size, patch_size))
+            else:
+                global_input = image
             global_input = global_input.unsqueeze(0).to(device)
             
             logger.info(f"图像分割为 {len(patches)} 个 patches")
@@ -418,7 +614,8 @@ def infer_image(
     return {
         'original': image.cpu(),
         'reconstructed': reconstructed_image.cpu(),
-        'shape': original_shape
+        'shape': original_shape,
+        'normalized': normalize,
     }
 
 
@@ -485,6 +682,7 @@ def infer_video(
     multiple_text_inputs: Optional[List[str]] = None,
     diagnose_branches: bool = False,
     default_fps: float = 10.0,
+    normalize: bool = False,
 ) -> Dict[str, Any]:
     """
     对视频进行推理
@@ -500,7 +698,7 @@ def infer_video(
         Dict[str, Any]: 推理结果
     """
     logger.info(f"加载视频: {video_path}")
-    video = load_video(video_path, max_frames=config.max_video_frames)  # [T, C, H, W]
+    video = load_video(video_path, max_frames=None, normalize=normalize)  # [T, C, H, W]
     fps = get_video_fps(video_path, default_fps)
     original_shape = video.shape
     
@@ -564,120 +762,33 @@ def infer_video(
     path_used = "standard"
 
     model.eval()
+    use_amp = getattr(config, "use_amp", False) and device.type == "cuda"
+    window_len, stride = resolve_infer_window(config)
+    logger.info(
+        "滑窗推理设置: window_len=%d stride=%d (sampling_strategy=%s)",
+        window_len,
+        stride,
+        getattr(config, "video_sampling_strategy", "unknown"),
+    )
     with torch.no_grad():
-        # 检查是否需要patch推理
-        expected_h, expected_w = (224, 224)  # 默认值
-        if hasattr(model, 'image_encoder') and hasattr(model.image_encoder, 'patch_embed'):
-            if hasattr(model.image_encoder.patch_embed, 'img_size'):
-                expected_h, expected_w = model.image_encoder.patch_embed.img_size
-            # 尝试获取期望的帧尺寸
-            pass  # 视频编码器可能没有固定的图像尺寸要求
-        pad_multiple = expected_h # 或者 64
-        padded_video, pad_h, pad_w = pad_image(video, pad_multiple)
-        need_patch = (original_shape[2] != expected_h or original_shape[3] != expected_w)
-        need_patch = (original_shape[2] != expected_h or original_shape[3] != expected_w)
-        if need_patch and config.use_patch_inference:
-            path_used = "patch-based"
-            logger.info(f"使用 patch-based 推理...")
-            patches_list, meta_list = split_video_v2(padded_video, expected_h, config.patch_overlap)
-        #if need_patch and config.use_patch_inference:
-            #logger.info(f"使用 patch-based 推理（patch_size={config.patch_size}, overlap={config.patch_overlap}）")
-            
-            # 分割视频（逐帧处理）
-            #patches_list, meta_list = split_video_v2(video, config.patch_size, config.patch_overlap)
-            patches_list, meta_list = split_video_v2(video, expected_h, config.patch_overlap)
-            logger.info(f"使用 patch-based 推理（patch_size={expected_h}, overlap={config.patch_overlap}）")
-            # 收集所有帧的所有patches
-            all_patches = []
-            frame_start_indices = [0]
-            current_idx = 0
-            
-            for t, frame_patches in enumerate(patches_list):
-                all_patches.append(frame_patches)
-                current_idx += len(frame_patches)
-                frame_start_indices.append(current_idx)
-            
-            # 批量处理所有patches
-            all_patches_tensor = torch.cat(all_patches, dim=0).to(device)
-            logger.info(f"视频分割为 {len(all_patches_tensor)} 个 patches（来自 {original_shape[0]} 帧）")
-            
-            # 【修复】使用分阶段处理：编码 -> 信道 -> 解码（传入语义上下文）
-            patch_results_list = []
-            patch_batch_size = 4  # 减小batch size以减少内存占用
-            
-            for i in range(0, len(all_patches_tensor), patch_batch_size):
-                patch_batch = all_patches_tensor[i:i+patch_batch_size]
-                
-                # 阶段1：编码
-                patch_encoded = model.encode(image_input=patch_batch, snr_db=config.snr_db)
-                patch_encoded_features = patch_encoded['image_encoded']
-                patch_guide_vectors = patch_encoded['image_guide']
-                
-                # 阶段2：功率归一化
-                #if 'image' in model.power_normalizer:
-                    #patch_encoded_features = model.power_normalizer['image'](patch_encoded_features)
-                
-                # 阶段3：信道传输
-                patch_transmitted = model.channel(patch_encoded_features)
-                
-                # 阶段4：解码（传入语义上下文以启用语义引导）
-                # 【优化】直接调用image_decoder以支持多条语义上下文
-                #patch_decoded_image = model.image_decoder(
-                    #patch_transmitted,
-                    #patch_guide_vectors,
-                    #semantic_context=semantic_context,
-                    #multiple_semantic_contexts=multiple_semantic_contexts,
-                    #snr_db=config.snr_db
-                #)
-                transmitted_dict = {'image': patch_transmitted}
-                guide_dict = {'image': patch_guide_vectors}
-                decoded_results = model.decode(
-                    transmitted_features=transmitted_dict,
-                    guide_vectors=guide_dict,
-                    semantic_context=semantic_context,
-                    multiple_semantic_contexts=multiple_semantic_contexts,
-                    snr_db=config.snr_db
-                )
-                patch_decoded_image = decoded_results['image_decoded']
-                # 立即移动到CPU以释放GPU内存
-                patch_results_list.append(patch_decoded_image.cpu())
-                
-                # 清理中间变量
-                del patch_encoded, patch_encoded_features, patch_guide_vectors
-                del patch_transmitted, patch_decoded_image, patch_batch
-                # 每处理几个batch后清理GPU缓存
-                if (i // patch_batch_size + 1) % 5 == 0:
-                    torch.cuda.empty_cache()
-            
-            # 合并所有patch结果（数据已在CPU上）
-            all_reconstructed_patches = torch.cat(patch_results_list, dim=0)
-            
-            # 按帧重组patches
-            reconstructed_patches_by_frame = []
-            for t in range(original_shape[0]):
-                start_idx = frame_start_indices[t]
-                end_idx = frame_start_indices[t + 1]
-                frame_patches = all_reconstructed_patches[start_idx:end_idx]
-                reconstructed_patches_by_frame.append(frame_patches)
-            
-            # 清理中间变量
-            del patch_results_list, all_reconstructed_patches, all_patches_tensor
-            torch.cuda.empty_cache()
-            
-            # 逐帧合并，重建视频
-            reconstructed_video = merge_video_v2(reconstructed_patches_by_frame, meta_list)
-            reconstructed_video = crop_image(reconstructed_video, pad_h, pad_w)
-            
+        reconstructed_video, path_used = sliding_window_reconstruct(
+            model=model,
+            video_full=video,
+            config=config,
+            device=device,
+            logger=logger,
+            use_amp=use_amp,
+            window_len=window_len,
+            stride=stride,
+        )
 
-        else:
-            path_used = "standard"
-            logger.info("使用标准推理")
-            video_input = padded_video.unsqueeze(0).to(device)
-            results = model(video_input=video_input, snr_db=config.snr_db)
-            reconstructed_video = results['video_decoded']
-            if reconstructed_video.dim() == 5:
-                reconstructed_video = reconstructed_video.squeeze(0)
-            reconstructed_video = crop_image(reconstructed_video, pad_h, pad_w)
+    reconstructed_video = reconstructed_video.cpu()
+    if getattr(config, "max_output_frames", None):
+        max_output_frames = config.max_output_frames
+        if max_output_frames > 0 and reconstructed_video.shape[0] > max_output_frames:
+            reconstructed_video = reconstructed_video[:max_output_frames]
+            video = video[:max_output_frames]
+            original_shape = video.shape
     
     if diagnose_branches:
         for handle in hook_handles:
@@ -689,12 +800,8 @@ def infer_video(
             branch_counters.get("image_decoder", 0),
             branch_counters.get("video_decoder", 0),
         )
-        if path_used == "patch-based":
-            logger.warning("[BranchDiagnose] 推理路径: patch-based (split_video_v2 / merge_video_v2)")
-            logger.warning(
-                "[BranchDiagnose] 当前 patch-based 路径逐帧调用 image 编解码，视频分支未参与。"
-                "如需确保视频分支参与，请使用 --no-patch 或实现 clip-level patch 视频推理。"
-            )
+        if path_used == "clip-patch-video":
+            logger.info("[BranchDiagnose] 推理路径: clip-level patch video (model(video_input=patches))")
         else:
             logger.info("[BranchDiagnose] 推理路径: standard (model(video_input=...))")
 
@@ -709,6 +816,7 @@ def infer_video(
         'shape': original_shape,
         'fps': fps,
         'path_used': path_used,
+        'normalized': normalize,
     }
 
 
@@ -728,6 +836,7 @@ def save_result(
         output_path: 输出路径（必须是完整的文件路径，对于图像和文本）
         modality: 模态类型（'image', 'text', 'video'）
     """
+    normalized = result.get("normalized", True)
     if modality == 'image':
         # 保存图像
         # 【修复】确保输出路径有有效的扩展名
@@ -735,13 +844,15 @@ def save_result(
             # 如果没有扩展名，添加默认的png扩展名
             output_path = output_path + '.png'
         
-        reconstructed_np = denormalize_image(result['reconstructed'])
+        reconstructed_np = denormalize_image(result['reconstructed'], normalized=normalized)
         Image.fromarray(reconstructed_np).save(output_path)
+        return output_path
     elif modality == 'text':
         # 保存文本（这里只是简单示例，实际应该解码）
         with open(output_path, 'w', encoding='utf-8') as f:
             f.write(f"原始文本:\n{result['original']}\n\n")
             f.write(f"重建文本（tensor）:\n{result['reconstructed']}\n")
+        return output_path
     elif modality == 'video':
         reconstructed = result['reconstructed']
         if reconstructed.dim() == 5:
@@ -757,7 +868,7 @@ def save_result(
 
         if save_video_mp4:
             first_frame = reconstructed[0]
-            frame_np = denormalize_video_frame(first_frame)
+            frame_np = denormalize_video_frame(first_frame, normalized=normalized)
             height, width = frame_np.shape[:2]
             writer = cv2.VideoWriter(
                 mp4_path,
@@ -766,7 +877,7 @@ def save_result(
                 (width, height),
             )
             for t in range(reconstructed.shape[0]):
-                frame = denormalize_video_frame(reconstructed[t])
+                frame = denormalize_video_frame(reconstructed[t], normalized=normalized)
                 writer.write(frame)
             writer.release()
 
@@ -775,9 +886,10 @@ def save_result(
                 frames_dir = os.path.splitext(output_path)[0] + "_frames"
             os.makedirs(frames_dir, exist_ok=True)
             for t in range(reconstructed.shape[0]):
-                frame = denormalize_image(reconstructed[t])
+                frame = denormalize_image(reconstructed[t], normalized=normalized)
                 frame_path = os.path.join(frames_dir, f"frame_{t:04d}.png")
                 Image.fromarray(frame).save(frame_path)
+        return mp4_path
 
 
 def load_model(model_path: str, config: EvaluationConfig, device: torch.device, logger: logging.Logger) -> MultimodalJSCC:
@@ -816,6 +928,14 @@ def load_model(model_path: str, config: EvaluationConfig, device: torch.device, 
                 "⚠️ Checkpoint 中缺少 pretrained_model_name，可能导致主干结构不匹配。"
                 "请在推理时使用 --pretrained-model-name 指定训练时的模型名称。"
             )
+        config.video_clip_len = model_config.get("video_clip_len", config.video_clip_len)
+        config.video_stride = model_config.get("video_stride", config.video_stride)
+        config.video_sampling_strategy = model_config.get(
+            "video_sampling_strategy", config.video_sampling_strategy
+        )
+        config.video_eval_sampling_strategy = model_config.get(
+            "video_eval_sampling_strategy", config.video_eval_sampling_strategy
+        )
     else:
         logger.warning("⚠️ Checkpoint 中未找到配置信息！将使用 EvaluationConfig 的默认值（极高风险！）")
         model_config = {
@@ -837,12 +957,19 @@ def load_model(model_path: str, config: EvaluationConfig, device: torch.device, 
             'video_use_optical_flow': config.video_use_optical_flow,
             'video_use_convlstm': config.video_use_convlstm,
             'video_output_dim': config.video_output_dim,
+            'video_decoder_type': getattr(config, "video_decoder_type", "unet"),
+            'video_unet_base_channels': getattr(config, "video_unet_base_channels", 64),
+            'video_unet_num_down': getattr(config, "video_unet_num_down", 4),
+            'video_unet_num_res_blocks': getattr(config, "video_unet_num_res_blocks", 2),
             'channel_type': config.channel_type,
             'snr_db': config.snr_db,
             'pretrained': False, # 推理时强制关闭
         }
         if getattr(config, "pretrained_model_name", None):
             model_config["pretrained_model_name"] = config.pretrained_model_name
+    model_config["snr_db"] = config.snr_db
+    model_config["use_text_guidance_image"] = getattr(config, "use_text_guidance_image", False)
+    model_config["use_text_guidance_video"] = getattr(config, "use_text_guidance_video", False)
     try:
          model = MultimodalJSCC(**model_config)
     except TypeError as e:
@@ -967,8 +1094,22 @@ def main():
     parser.add_argument('--modality', type=str, choices=['image', 'text', 'video'], 
                        default=None, help='模态类型（如果不指定，将从文件扩展名推断）')
     parser.add_argument('--snr', type=float, default=10.0, help='信噪比 (dB)')
+    parser.add_argument('--snr-random', action='store_true', help='推理时启用随机SNR')
+    parser.add_argument('--snr-min', type=float, default=None, help='推理随机SNR最小值')
+    parser.add_argument('--snr-max', type=float, default=None, help='推理随机SNR最大值')
     parser.add_argument('--no-patch', action='store_true', help='禁用patch-based推理')
     parser.add_argument('--video_fps', type=float, default=10.0, help='视频保存帧率')
+    parser.add_argument('--infer-window-len', type=int, default=None, help='滑窗推理window长度')
+    parser.add_argument('--infer-window-stride', type=int, default=None, help='滑窗推理stride')
+    parser.add_argument('--max-output-frames', type=int, default=None, help='推理输出最大帧数（调试用）')
+    parser.add_argument(
+        '--video-sampling-strategy',
+        type=str,
+        default=None,
+        choices=["contiguous_clip", "uniform", "fixed_start"],
+        help='推理侧记录的采样策略（用于日志显示）',
+    )
+    parser.add_argument('--normalize', action='store_true', help='使用ImageNet归一化（与旧模型兼容）')
     parser.add_argument(
         '--save_video_mp4',
         action=argparse.BooleanOptionalAction,
@@ -977,6 +1118,8 @@ def main():
     )
     parser.add_argument('--save_video_frames', action='store_true', help='保存视频帧序列')
     parser.add_argument('--diagnose_branches', action='store_true', help='诊断视频分支调用情况')
+    parser.add_argument('--use-text-guidance-image', action='store_true', help='启用文本语义引导图像重建')
+    parser.add_argument('--use-text-guidance-video', action='store_true', help='启用文本语义引导视频重建')
     parser.add_argument('--text-input', type=str, default=None, 
                        help='文本输入路径（用于语义引导图像/视频解码）')
     parser.add_argument('--prompt', type=str, default=None,
@@ -999,8 +1142,27 @@ def main():
     config.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     config.model_path = args.model_path
     config.snr_db = args.snr
+    config.snr_random = args.snr_random
+    if args.snr_min is not None:
+        config.snr_min = args.snr_min
+    if args.snr_max is not None:
+        config.snr_max = args.snr_max
     config.use_patch_inference = not args.no_patch
     config.pretrained_model_name = args.pretrained_model_name
+    config.infer_window_len = args.infer_window_len
+    config.infer_window_stride = args.infer_window_stride
+    config.max_output_frames = args.max_output_frames
+    if args.use_text_guidance_image:
+        config.use_text_guidance_image = True
+    if args.use_text_guidance_video:
+        config.use_text_guidance_video = True
+    if args.video_sampling_strategy:
+        config.video_sampling_strategy = args.video_sampling_strategy
+    if config.snr_random:
+        snr_generator = torch.Generator(device="cpu")
+        snr_generator.manual_seed(config.seed)
+        rand_value = torch.rand(1, generator=snr_generator).item()
+        config.snr_db = config.snr_min + (config.snr_max - config.snr_min) * rand_value
     
     # 推断模态类型
     if args.modality is None:
@@ -1093,9 +1255,15 @@ def main():
     logger.info(f"输入文件: {args.input}")
     logger.info(f"输出路径: {args.output}")
     logger.info(f"模态类型: {modality}")
-    logger.info(f"SNR: {config.snr_db} dB")
+    if config.snr_random:
+        logger.info(
+            f"SNR: {config.snr_db:.2f} dB (random in [{config.snr_min}, {config.snr_max}])"
+        )
+    else:
+        logger.info(f"SNR: {config.snr_db} dB")
     logger.info(f"设备: {config.device}")
     logger.info(f"Patch推理: {'启用' if config.use_patch_inference else '禁用'}")
+    logger.info(f"Normalize: {'启用' if args.normalize else '禁用'} (默认与训练一致)")
     
     # 加载模型
     model = load_model(config.model_path, config, config.device, logger)
@@ -1131,25 +1299,48 @@ def main():
     # 执行推理
     logger.info("开始推理...")
     if modality == 'image':
-        result = infer_image(model, args.input, config, config.device, logger, 
-                            text_input=text_input, 
-                            text_attention_mask=text_attention_mask,
-                            multiple_text_inputs=multiple_text_inputs)
+        result = infer_image(
+            model,
+            args.input,
+            config,
+            config.device,
+            logger,
+            text_input=text_input,
+            text_attention_mask=text_attention_mask,
+            multiple_text_inputs=multiple_text_inputs,
+            normalize=args.normalize,
+        )
     elif modality == 'text':
         result = infer_text(model, args.input, config, config.device, logger)
     elif modality == 'video':
-        result = infer_video(model, args.input, config, config.device, logger,
-                            text_input=text_input, 
-                            text_attention_mask=text_attention_mask,
-                            multiple_text_inputs=multiple_text_inputs,
-                            diagnose_branches=args.diagnose_branches,
-                            default_fps=args.video_fps)
+        input_meta = get_video_meta(args.input)
+        logger.info(
+            "[InputVideoMeta] width=%d, height=%d, fps=%.3f, frame_count=%d, duration=%.3f",
+            input_meta["width"],
+            input_meta["height"],
+            input_meta["fps"],
+            input_meta["frame_count"],
+            input_meta["duration"],
+        )
+        result = infer_video(
+            model,
+            args.input,
+            config,
+            config.device,
+            logger,
+            text_input=text_input,
+            text_attention_mask=text_attention_mask,
+            multiple_text_inputs=multiple_text_inputs,
+            diagnose_branches=args.diagnose_branches,
+            default_fps=args.video_fps,
+            normalize=args.normalize,
+        )
     else:
         raise ValueError(f"不支持的模态类型: {modality}")
     
     # 保存结果
     logger.info(f"保存结果到: {args.output}")
-    save_result(
+    saved_path = save_result(
         result,
         args.output,
         modality,
@@ -1157,6 +1348,16 @@ def main():
         save_video_mp4=args.save_video_mp4,
         save_video_frames=args.save_video_frames,
     )
+    if modality == 'video' and saved_path:
+        output_meta = get_video_meta(saved_path)
+        logger.info(
+            "[OutputVideoMeta] width=%d, height=%d, fps=%.3f, frame_count=%d, duration=%.3f",
+            output_meta["width"],
+            output_meta["height"],
+            output_meta["fps"],
+            output_meta["frame_count"],
+            output_meta["duration"],
+        )
     
     logger.info("=" * 80)
     logger.info("推理完成！")

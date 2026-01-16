@@ -74,12 +74,16 @@ def create_model(config: TrainingConfig) -> MultimodalJSCC:
         video_use_optical_flow=config.video_use_optical_flow,
         video_use_convlstm=config.video_use_convlstm,
         video_output_dim=config.video_output_dim,
+        video_decoder_type=getattr(config, "video_decoder_type", "unet"),
+        video_unet_base_channels=getattr(config, "video_unet_base_channels", 64),
+        video_unet_num_down=getattr(config, "video_unet_num_down", 4),
+        video_unet_num_res_blocks=getattr(config, "video_unet_num_res_blocks", 2),
         channel_type=config.channel_type,
         snr_db=config.snr_db,
         use_quantization_noise=getattr(config, 'use_quantization_noise', False),
         quantization_noise_range=getattr(config, 'quantization_noise_range', 0.5),
         use_text_guidance_image=getattr(config, "use_text_guidance_image", False),
-        use_text_guidance_video=getattr(config, "use_text_guidance_video", True),
+        use_text_guidance_video=getattr(config, "use_text_guidance_video", False),
         enforce_text_condition=getattr(config, "enforce_text_condition", True),
         condition_margin_weight=getattr(config, "condition_margin_weight", 0.0),
         condition_margin=getattr(config, "condition_margin", 0.05),
@@ -92,6 +96,7 @@ def create_model(config: TrainingConfig) -> MultimodalJSCC:
 
 def create_loss_fn(config: TrainingConfig) -> MultimodalLoss:
     """创建损失函数"""
+    gan_weight = getattr(config, 'gan_weight', getattr(config, 'discriminator_weight', 0.01))
     loss_fn = MultimodalLoss(
         text_weight=config.text_weight,
         image_weight=config.image_weight,
@@ -103,7 +108,7 @@ def create_loss_fn(config: TrainingConfig) -> MultimodalLoss:
         video_text_contrastive_weight=getattr(config, 'video_text_contrastive_weight', 0.05),  # 【新增】视频-文本对比损失权重
         rate_weight=getattr(config, 'rate_weight', 1e-4),  # 【新增】码率/能量约束权重
         temporal_consistency_weight=getattr(config, 'temporal_consistency_weight', 0.02),  # 【新增】视频时序一致性正则权重
-        discriminator_weight=getattr(config, 'discriminator_weight', 0.01),  # 【Phase 3】对抗损失权重
+        gan_weight=gan_weight,  # 【Phase 6】对抗损失权重
         use_adversarial=getattr(config, 'use_adversarial', False),  # 【Phase 3】是否使用对抗训练
         condition_margin_weight=getattr(config, "condition_margin_weight", 0.0),
         condition_margin=getattr(config, "condition_margin", 0.05),
@@ -155,6 +160,23 @@ def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
     return model
 
 
+def compute_bandwidth_ratio(config: TrainingConfig, epoch: int) -> float:
+    start = float(getattr(config, "bandwidth_ratio_start", 1.0))
+    end = float(getattr(config, "bandwidth_ratio_end", start))
+    warmup = max(0, int(getattr(config, "bandwidth_warmup_epochs", 0)))
+    anneal = max(0, int(getattr(config, "bandwidth_anneal_epochs", 0)))
+
+    if end == start:
+        return start
+    if epoch < warmup:
+        return start
+    if anneal <= 0:
+        return end
+    progress = (epoch - warmup + 1) / float(anneal)
+    progress = max(0.0, min(1.0, progress))
+    return start + (end - start) * progress
+
+
 def _log_nonfinite_tensor(
     logger: logging.Logger,
     tensor: torch.Tensor,
@@ -187,6 +209,18 @@ def _log_nonfinite_tensor(
         t_mean,
     )
     return True
+
+
+def _compute_r1_penalty(d_out: torch.Tensor, real_input: torch.Tensor) -> torch.Tensor:
+    grad = torch.autograd.grad(
+        outputs=d_out.sum(),
+        inputs=real_input,
+        create_graph=True,
+        retain_graph=True,
+        only_inputs=True,
+    )[0]
+    grad = grad.view(grad.shape[0], -1)
+    return grad.pow(2).sum(1).mean()
 
 
 def train_one_epoch(
@@ -222,6 +256,9 @@ def train_one_epoch(
         'video_percep_loss': AverageMeter(),
         'video_temporal_loss': AverageMeter(),
         'condition_margin_loss': AverageMeter(),
+        'adversarial_loss': AverageMeter(),
+        'disc_loss_real': AverageMeter(),
+        'disc_loss_fake': AverageMeter(),
         'video_semantic_gate_mean': AverageMeter(),
         'time': AverageMeter()
     }
@@ -232,13 +269,22 @@ def train_one_epoch(
     
     global_step = epoch * len(train_loader)
     accumulation_steps = config.gradient_accumulation_steps
+    snr_generator = None
+    if config.train_snr_random:
+        snr_generator = torch.Generator(device="cpu")
+        snr_generator.manual_seed(config.seed + epoch)
     
     # 只在每个累积周期的第一步清零梯度
     #optimizer.zero_grad()
     #if optimizer_d is not None:
         #optimizer_d.zero_grad()
     adv_loss_fn = None
-    if discriminator is not None:
+    gan_enable_epoch = int(getattr(config, "gan_enable_epoch", 0))
+    d_updates_per_g = max(1, int(getattr(config, "d_updates_per_g", 1)))
+    use_r1 = bool(getattr(config, "use_r1_regularization", False))
+    r1_gamma = float(getattr(config, "r1_gamma", 10.0))
+    gan_active = bool(getattr(config, "use_adversarial", False)) and epoch >= gan_enable_epoch
+    if discriminator is not None and gan_active:
         from losses import AdversarialLoss
         adv_loss_fn = AdversarialLoss().to(device)
 
@@ -285,7 +331,8 @@ def train_one_epoch(
         
         # 随机SNR（如果启用）
         if config.train_snr_random:
-            snr_db = np.random.uniform(config.train_snr_min, config.train_snr_max)
+            rand_value = torch.rand(1, generator=snr_generator).item()
+            snr_db = config.train_snr_min + (config.train_snr_max - config.train_snr_min) * rand_value
         else:
             snr_db = config.snr_db
         
@@ -312,25 +359,24 @@ def train_one_epoch(
             
             # 【Phase 3】如果启用对抗训练，计算判别器输出
             discriminator_outputs = None
-            if discriminator is not None:
-                #with torch.no_grad():
-                    for p in discriminator.parameters(): p.requires_grad = False
+            if discriminator is not None and gan_active:
+                # 判别器在生成器训练时不需要梯度
+                for p in discriminator.parameters():
+                    p.requires_grad = False
 
-                    # 判别器在生成器训练时不需要梯度
-                    image_disc_pred = None
-                    video_disc_pred = None
-                    if 'image_decoded' in results:
-                        image_disc_pred, _ = discriminator(image=results['image_decoded'])
-                    if 'video_decoded' in results:
-                        _, video_disc_pred = discriminator(video=results['video_decoded'])
-                    discriminator_outputs = {}
-                    if image_disc_pred is not None: discriminator_outputs['image'] = image_disc_pred
-                    if video_disc_pred is not None: discriminator_outputs['video'] = video_disc_pred
-                    for p in discriminator.parameters(): p.requires_grad = True
-                    #if image_disc_pred is not None:
-                        #discriminator_outputs['image'] = image_disc_pred
-                    #if video_disc_pred is not None:
-                        #discriminator_outputs['video'] = video_disc_pred
+                image_disc_pred = None
+                video_disc_pred = None
+                if 'image_decoded' in results:
+                    image_disc_pred, _ = discriminator(image=results['image_decoded'])
+                if 'video_decoded' in results:
+                    _, video_disc_pred = discriminator(video=results['video_decoded'])
+                discriminator_outputs = {}
+                if image_disc_pred is not None:
+                    discriminator_outputs['image'] = image_disc_pred
+                if video_disc_pred is not None:
+                    discriminator_outputs['video'] = video_disc_pred
+                for p in discriminator.parameters():
+                    p.requires_grad = True
             
             # 条件边际约束：对同一传输特征使用打乱文本解码，强制文本条件有效
             condition_enabled = (
@@ -405,41 +451,9 @@ def train_one_epoch(
             scaler.scale(total_loss).backward()
         else:
             total_loss.backward()
-        if discriminator is not None and optimizer_d is not None:
-            disc_loss_real = torch.tensor(0.0, device=device)
-            disc_loss_fake = torch.tensor(0.0, device=device)
-            with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-                if 'image' in device_targets:
-                    real_img_pred, _ = discriminator(image=device_targets['image'])
-                    if adv_loss_fn is None:
-                        from losses import AdversarialLoss
-                        adv_loss_fn = AdversarialLoss().to(device)
-                    disc_loss_real = disc_loss_real + adv_loss_fn(real_img_pred, target_is_real=True)
-                if 'video' in device_targets:
-                    _, video_real_pred = discriminator(video=device_targets['video'])
-                    if adv_loss_fn is None:
-                        from losses import AdversarialLoss
-                        adv_loss_fn = AdversarialLoss().to(device)
-                    disc_loss_real = disc_loss_real + adv_loss_fn(video_real_pred, target_is_real=True)
-                if 'image_decoded' in results:
-                    image_fake_pred, _ = discriminator(image=results['image_decoded'].detach())
-                    if adv_loss_fn is None:
-                        from losses import AdversarialLoss
-                        adv_loss_fn = AdversarialLoss().to(device)
-                    disc_loss_fake = disc_loss_fake + adv_loss_fn(image_fake_pred, target_is_real=False)
-                if 'video_decoded' in results:
-                    _, video_fake_pred = discriminator(video=results['video_decoded'].detach())
-                    if adv_loss_fn is None:
-                        from losses import AdversarialLoss
-                        adv_loss_fn = AdversarialLoss().to(device)
-                    disc_loss_fake = disc_loss_fake + adv_loss_fn(video_fake_pred, target_is_real=False)
-                disc_loss = (disc_loss_real + disc_loss_fake) * 0.5
-                disc_loss = disc_loss / accumulation_steps
-            if scaler is not None:
-                scaler.scale(disc_loss).backward()
-            else:
-                disc_loss.backward()
-        
+        disc_loss_real_value = None
+        disc_loss_fake_value = None
+
         # 梯度累积：只在累积步数达到时更新参数
         if (batch_idx + 1) % accumulation_steps == 0:
             # 梯度裁剪（更严格的裁剪，防止梯度爆炸）
@@ -496,17 +510,58 @@ def train_one_epoch(
  
             
             # 【Phase 3】训练判别器（如果启用对抗训练）
-            if not skip_update_manual and discriminator is not None and optimizer_d is not None:
-                if config.grad_clip_norm > 0:
+            if (
+                not skip_update_manual
+                and discriminator is not None
+                and optimizer_d is not None
+                and gan_active
+            ):
+                for _ in range(d_updates_per_g):
+                    optimizer_d.zero_grad()
+                    disc_loss_real = torch.tensor(0.0, device=device)
+                    disc_loss_fake = torch.tensor(0.0, device=device)
+                    r1_penalty = torch.tensor(0.0, device=device)
+                    with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+                        if 'image' in device_targets:
+                            real_image = device_targets['image']
+                            if use_r1:
+                                real_image = real_image.requires_grad_(True)
+                            real_img_pred, _ = discriminator(image=real_image)
+                            disc_loss_real = disc_loss_real + adv_loss_fn(real_img_pred, target_is_real=True)
+                            if use_r1:
+                                r1_penalty = r1_penalty + _compute_r1_penalty(real_img_pred, real_image)
+                        if 'video' in device_targets:
+                            real_video = device_targets['video']
+                            if use_r1:
+                                real_video = real_video.requires_grad_(True)
+                            _, video_real_pred = discriminator(video=real_video)
+                            disc_loss_real = disc_loss_real + adv_loss_fn(video_real_pred, target_is_real=True)
+                            if use_r1:
+                                r1_penalty = r1_penalty + _compute_r1_penalty(video_real_pred, real_video)
+                        if 'image_decoded' in results:
+                            image_fake_pred, _ = discriminator(image=results['image_decoded'].detach())
+                            disc_loss_fake = disc_loss_fake + adv_loss_fn(image_fake_pred, target_is_real=False)
+                        if 'video_decoded' in results:
+                            _, video_fake_pred = discriminator(video=results['video_decoded'].detach())
+                            disc_loss_fake = disc_loss_fake + adv_loss_fn(video_fake_pred, target_is_real=False)
+                        disc_loss = (disc_loss_real + disc_loss_fake) * 0.5
+                        if use_r1:
+                            disc_loss = disc_loss + 0.5 * r1_gamma * r1_penalty
                     if scaler is not None:
-                        scaler.unscale_(optimizer_d)
-                    torch.nn.utils.clip_grad_norm_(discriminator.parameters(), config.grad_clip_norm)
-                if scaler is not None:
-                    scaler.step(optimizer_d)
-                else:
-                    optimizer_d.step()
-                optimizer_d.zero_grad()
-                
+                        scaler.scale(disc_loss).backward()
+                    else:
+                        disc_loss.backward()
+                    if config.grad_clip_norm > 0:
+                        if scaler is not None:
+                            scaler.unscale_(optimizer_d)
+                        torch.nn.utils.clip_grad_norm_(discriminator.parameters(), config.grad_clip_norm)
+                    if scaler is not None:
+                        scaler.step(optimizer_d)
+                    else:
+                        optimizer_d.step()
+                    disc_loss_real_value = disc_loss_real.item()
+                    disc_loss_fake_value = disc_loss_fake.item()
+
      
             if scaler is not None:
                 scaler.update()
@@ -540,6 +595,12 @@ def train_one_epoch(
             meters['video_temporal_loss'].update(loss_dict.get('video_temporal_loss_l1', 0.0))
         if 'condition_margin_loss' in loss_dict:
             meters['condition_margin_loss'].update(loss_dict.get('condition_margin_loss', 0.0))
+        if 'adversarial_loss' in loss_dict:
+            meters['adversarial_loss'].update(loss_dict.get('adversarial_loss', 0.0))
+        if disc_loss_real_value is not None:
+            meters['disc_loss_real'].update(disc_loss_real_value)
+        if disc_loss_fake_value is not None:
+            meters['disc_loss_fake'].update(disc_loss_fake_value)
         if results.get("video_semantic_gate_mean") is not None:
             meters['video_semantic_gate_mean'].update(results.get("video_semantic_gate_mean", 0.0))
         
@@ -556,7 +617,8 @@ def train_one_epoch(
                 f'Step [{batch_idx + 1}/{len(train_loader)}] | '
                 f'Loss {meters["loss"].val:.4f} ({meters["loss"].avg:.4f}) | '
                 f'Time {meters["time"].val:.3f}s | '
-                f'LR {current_lr:.6f}'
+                f'LR {current_lr:.6f} | '
+                f'SNR {snr_db:.2f} dB'
             )
             
             if text_input is not None and meters['text_loss'].count > 0:
@@ -565,6 +627,12 @@ def train_one_epoch(
                 log_msg += f' | ImageLoss {meters["image_loss"].avg:.4f}'
             if video_input is not None and meters['video_loss'].count > 0:
                 log_msg += f' | VideoLoss {meters["video_loss"].avg:.4f}'
+            if meters['adversarial_loss'].count > 0:
+                log_msg += f' | AdvLoss {meters["adversarial_loss"].avg:.4f}'
+            if meters['disc_loss_real'].count > 0:
+                log_msg += f' | DiscReal {meters["disc_loss_real"].avg:.4f}'
+            if meters['disc_loss_fake'].count > 0:
+                log_msg += f' | DiscFake {meters["disc_loss_fake"].avg:.4f}'
             
             logger.info(log_msg)
             
@@ -693,6 +761,27 @@ def main():
     parser.add_argument('--epochs', type=int, default=None, help='训练轮数')
     parser.add_argument('--max-samples', type=int, default=None, help='最大训练样本数（用于快速训练，None表示使用全部数据）')
     parser.add_argument('--max-val-samples', type=int, default=None, help='最大验证样本数（None表示使用全部数据）')
+    parser.add_argument('--video-clip-len', type=int, default=None, help='视频训练clip长度')
+    parser.add_argument('--video-stride', type=int, default=None, help='视频滑窗stride')
+    parser.add_argument('--train-snr-random', action='store_true', help='训练时启用随机SNR')
+    parser.add_argument('--train-snr-min', type=float, default=None, help='训练随机SNR最小值')
+    parser.add_argument('--train-snr-max', type=float, default=None, help='训练随机SNR最大值')
+    parser.add_argument('--use-text-guidance-image', action='store_true', help='启用文本语义引导图像重建')
+    parser.add_argument('--use-text-guidance-video', action='store_true', help='启用文本语义引导视频重建')
+    parser.add_argument(
+        '--video-sampling-strategy',
+        type=str,
+        default=None,
+        choices=["contiguous_clip", "uniform", "fixed_start"],
+        help='训练视频采样策略',
+    )
+    parser.add_argument(
+        '--video-eval-sampling-strategy',
+        type=str,
+        default=None,
+        choices=["contiguous_clip", "uniform", "fixed_start"],
+        help='验证视频采样策略',
+    )
     parser.add_argument('--local-rank', type=int, default=None, help='分布式训练的本地进程rank')
     parser.add_argument('--distributed', action='store_true', help='启用分布式训练')
     args = parser.parse_args()
@@ -739,6 +828,25 @@ def main():
         config.batch_size = args.batch_size
     if args.epochs:
         config.num_epochs = args.epochs
+    if args.video_clip_len:
+        config.video_clip_len = args.video_clip_len
+        config.max_video_frames = args.video_clip_len
+    if args.video_stride:
+        config.video_stride = args.video_stride
+    if args.video_sampling_strategy:
+        config.video_sampling_strategy = args.video_sampling_strategy
+    if args.video_eval_sampling_strategy:
+        config.video_eval_sampling_strategy = args.video_eval_sampling_strategy
+    if args.train_snr_random:
+        config.train_snr_random = True
+    if args.train_snr_min is not None:
+        config.train_snr_min = args.train_snr_min
+    if args.train_snr_max is not None:
+        config.train_snr_max = args.train_snr_max
+    if args.use_text_guidance_image:
+        config.use_text_guidance_image = True
+    if args.use_text_guidance_video:
+        config.use_text_guidance_video = True
     
     # 配置日志
     if is_main_process:
@@ -764,6 +872,13 @@ def main():
     logger.info(f"数据目录: {config.data_dir}")
     logger.info(f"训练清单: {config.train_manifest}")
     logger.info(f"验证清单: {config.val_manifest}")
+    logger.info(
+        "视频采样设置: clip_len=%d stride=%d train_strategy=%s val_strategy=%s",
+        config.video_clip_len,
+        config.video_stride,
+        config.video_sampling_strategy,
+        config.video_eval_sampling_strategy,
+    )
     
     # 加载数据清单
     logger.info("加载数据清单...")
@@ -842,9 +957,21 @@ def main():
     
     # 【Phase 1】如果启用预训练，记录信息
     if getattr(config, 'pretrained', False):
-        logger.info(f"【Phase 1】使用预训练权重: {getattr(config, 'pretrained_model_name', 'swin_tiny_patch4_window7_224')}")
-        if getattr(config, 'freeze_encoder', False):
-            logger.info("【Phase 1】编码器主干已冻结，仅训练适配器层")
+        real_model = unwrap_model(model)
+        image_encoder = getattr(real_model, "image_encoder", None)
+        image_pretrained_active = bool(getattr(image_encoder, "pretrained", False))
+        if image_pretrained_active:
+            logger.info(
+                "【Phase 1】使用预训练权重: "
+                f"{getattr(config, 'pretrained_model_name', 'swin_tiny_patch4_window7_224')}"
+            )
+            if getattr(config, 'freeze_encoder', False):
+                logger.info("【Phase 1】编码器主干已冻结，仅训练适配器层")
+        else:
+            logger.info(
+                "【Phase 1】预训练权重在配置中启用，但当前图像编码器未加载预训练权重，"
+                "将使用随机初始化。"
+            )
     
     # 打印模型信息
     total_params = sum(p.numel() for p in model.parameters())
@@ -909,6 +1036,10 @@ def main():
         image_size=config.img_size,
         max_text_length=config.max_text_length,
         max_video_frames=config.max_video_frames,
+        video_clip_len=config.video_clip_len,
+        video_stride=config.video_stride,
+        video_sampling_strategy=config.video_sampling_strategy,
+        video_eval_sampling_strategy=config.video_eval_sampling_strategy,
         prefetch_factor=getattr(config, 'prefetch_factor', 2),
         allow_missing_modalities=getattr(config, "allow_missing_modalities", False),
         strict_mode=getattr(config, "strict_data_loading", True),
@@ -1016,6 +1147,18 @@ def main():
         'pretrained': getattr(config, 'pretrained', False),
         'freeze_encoder': getattr(config, 'freeze_encoder', False),
         'pretrained_model_name': getattr(config, 'pretrained_model_name', None),
+        'video_clip_len': config.video_clip_len,
+        'video_stride': config.video_stride,
+        'video_sampling_strategy': config.video_sampling_strategy,
+        'video_eval_sampling_strategy': config.video_eval_sampling_strategy,
+        'snr_db': config.snr_db,
+        'train_snr_random': config.train_snr_random,
+        'train_snr_min': config.train_snr_min,
+        'train_snr_max': config.train_snr_max,
+        'bandwidth_ratio_start': getattr(config, "bandwidth_ratio_start", 1.0),
+        'bandwidth_ratio_end': getattr(config, "bandwidth_ratio_end", 1.0),
+        'bandwidth_warmup_epochs': getattr(config, "bandwidth_warmup_epochs", 0),
+        'bandwidth_anneal_epochs': getattr(config, "bandwidth_anneal_epochs", 0),
 
     }
     
@@ -1028,6 +1171,17 @@ def main():
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
         model_to_save = unwrap_model(model)
+        current_bandwidth_ratio = compute_bandwidth_ratio(config, epoch)
+        if hasattr(model_to_save, "set_bandwidth_ratio"):
+            model_to_save.set_bandwidth_ratio(current_bandwidth_ratio)
+        logger.info(
+            "带宽门控 ratio=%.4f (start=%.4f end=%.4f warmup=%d anneal=%d)",
+            current_bandwidth_ratio,
+            getattr(config, "bandwidth_ratio_start", 1.0),
+            getattr(config, "bandwidth_ratio_end", 1.0),
+            getattr(config, "bandwidth_warmup_epochs", 0),
+            getattr(config, "bandwidth_anneal_epochs", 0),
+        )
         
         # 训练
         train_metrics = train_one_epoch(

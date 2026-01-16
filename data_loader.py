@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
@@ -48,6 +49,35 @@ def _default_video_transform(image_size: Tuple[int, int], normalize: bool) -> tr
     return transforms.Compose(transform_steps)
 
 
+def _round_to_multiple(value: int, multiple: int) -> int:
+    if multiple <= 1:
+        return value
+    return max(multiple, int(round(value / multiple)) * multiple)
+
+
+def _build_dynamic_sizes(
+    image_size: Tuple[int, int],
+    scales: Tuple[float, ...] = (1.0, 1.25),
+    multiple: int = 4,
+) -> List[Tuple[int, int]]:
+    sizes = []
+    for scale in scales:
+        h = _round_to_multiple(int(image_size[0] * scale), multiple)
+        w = _round_to_multiple(int(image_size[1] * scale), multiple)
+        sizes.append((max(1, h), max(1, w)))
+    return sorted(set(sizes))
+
+
+def _build_resize_transform(size: Tuple[int, int], normalize: bool) -> transforms.Compose:
+    transform_steps = [
+        transforms.Resize(size),
+        transforms.ToTensor(),
+    ]
+    if normalize:
+        transform_steps.append(transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD))
+    return transforms.Compose(transform_steps)
+
+
 def _load_manifest(manifest: str) -> List[Dict[str, Any]]:
     with open(manifest, "r", encoding="utf-8") as f:
         return json.load(f)
@@ -65,6 +95,10 @@ class MultimodalDataset(Dataset):
         video_transform: Optional[transforms.Compose] = None,
         max_text_length: int = 512,
         max_video_frames: int = 10,
+        video_clip_len: Optional[int] = None,
+        video_stride: int = 1,
+        video_sampling_strategy: str = "contiguous_clip",
+        video_eval_sampling_strategy: str = "uniform",
         image_size: Tuple[int, int] = (224, 224),
         is_train: bool = True,
         allow_missing_modalities: bool = False,
@@ -76,10 +110,20 @@ class MultimodalDataset(Dataset):
         self.data_dir = data_dir
         self.data_list = list(data_list)
         self.text_tokenizer = text_tokenizer
+        self.dynamic_image_sizes = None
+        self.dynamic_video_sizes = None
+        if image_transform is None and is_train:
+            self.dynamic_image_sizes = _build_dynamic_sizes(image_size)
         self.image_transform = image_transform or _default_image_transform(image_size, normalize)
+        if video_transform is None and is_train:
+            self.dynamic_video_sizes = _build_dynamic_sizes(image_size)
         self.video_transform = video_transform or _default_video_transform(image_size, normalize)
         self.max_text_length = max_text_length
         self.max_video_frames = max_video_frames
+        self.video_clip_len = video_clip_len or max_video_frames
+        self.video_stride = video_stride
+        self.video_sampling_strategy = video_sampling_strategy
+        self.video_eval_sampling_strategy = video_eval_sampling_strategy
         self.image_size = image_size
         self.is_train = is_train
         self.allow_missing_modalities = allow_missing_modalities
@@ -95,6 +139,24 @@ class MultimodalDataset(Dataset):
         self.version = "v2" if any("texts" in item.get("text", {}) for item in self.data_list) else "v1"
         if self.version == "v1":
             warnings.warn("检测到 manifest v1：会导致重复解码与语义错配，建议迁移到 v2。", UserWarning)
+
+    def _select_dynamic_size(self, candidates: Optional[List[Tuple[int, int]]]) -> Optional[Tuple[int, int]]:
+        if not candidates:
+            return None
+        return self.random_state.choice(candidates)
+
+    def _apply_image_transform(self, image: Image.Image) -> torch.Tensor:
+        size = self._select_dynamic_size(self.dynamic_image_sizes)
+        if size is not None:
+            transform = _build_resize_transform(size, self.normalize)
+            return transform(image)
+        return self.image_transform(image)
+
+    def _apply_video_transform(self, frame: Image.Image, size: Optional[Tuple[int, int]]) -> torch.Tensor:
+        if size is not None:
+            transform = _build_resize_transform(size, self.normalize)
+            return transform(frame)
+        return self.video_transform(frame)
 
     def __len__(self) -> int:
         return len(self.data_list)
@@ -146,7 +208,43 @@ class MultimodalDataset(Dataset):
     def _load_image(self, image_path: str) -> torch.Tensor:
         full_path = os.path.join(self.data_dir, image_path)
         image = Image.open(full_path).convert("RGB")
-        return self.image_transform(image)
+        return self._apply_image_transform(image)
+
+    def _resolve_video_sampling_strategy(self) -> str:
+        if self.is_train:
+            return self.video_sampling_strategy
+        return self.video_eval_sampling_strategy or self.video_sampling_strategy
+
+    def _select_video_indices(self, total_frames: int, strategy: str) -> Tuple[List[int], int]:
+        clip_len = self.video_clip_len
+        stride = max(1, int(self.video_stride))
+        if total_frames <= 0:
+            raise RuntimeError("视频为空")
+        if strategy == "contiguous_clip":
+            effective_span = (clip_len - 1) * stride + 1
+            if total_frames >= effective_span:
+                start = self.random_state.randint(0, total_frames - effective_span)
+                return [start + i * stride for i in range(clip_len)], clip_len
+            return list(range(total_frames)), total_frames
+        if strategy == "fixed_start":
+            effective_span = (clip_len - 1) * stride + 1
+            if total_frames >= effective_span:
+                return [i * stride for i in range(clip_len)], clip_len
+            return list(range(total_frames)), total_frames
+        if strategy == "uniform":
+            candidate_indices = list(range(0, total_frames, stride))
+            sample_count = min(len(candidate_indices), clip_len)
+            if sample_count <= 0:
+                return [0], 1
+            if len(candidate_indices) == sample_count:
+                return candidate_indices, sample_count
+            if len(candidate_indices) > 1:
+                linspace_positions = np.linspace(
+                    0, len(candidate_indices) - 1, num=sample_count, dtype=int
+                ).tolist()
+                return [candidate_indices[i] for i in linspace_positions], sample_count
+            return [candidate_indices[0]] * sample_count, sample_count
+        raise ValueError(f"不支持的视频采样策略: {strategy}")
 
     def _load_video_frames(self, video_path: str) -> Tuple[torch.Tensor, torch.Tensor]:
         full_path = os.path.join(self.data_dir, video_path)
@@ -163,37 +261,51 @@ class MultimodalDataset(Dataset):
                     break
                 total_frames += 1
             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-        sample_count = min(total_frames, self.max_video_frames)
-        if sample_count <= 0:
+        strategy = self._resolve_video_sampling_strategy()
+        target_indices, true_frames = self._select_video_indices(total_frames, strategy)
+        if true_frames <= 0:
             cap.release()
             raise RuntimeError(f"视频为空: {full_path}")
-        target_indices = (
-            np.linspace(0, total_frames - 1, num=sample_count, dtype=int).tolist()
-            if total_frames > 1
-            else [0] * sample_count
-        )
         frames: List[Image.Image] = []
-        current_idx = 0
-        target_ptr = 0
-        while target_ptr < len(target_indices):
-            ret, frame = cap.read()
-            if not ret:
-                break
-            if current_idx == target_indices[target_ptr]:
+        if (
+            strategy in {"contiguous_clip", "fixed_start"}
+            and total_frames >= self.video_clip_len
+            and self.video_stride == 1
+        ):
+            start = target_indices[0]
+            if start > 0:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, start)
+            for _ in range(self.video_clip_len):
+                ret, frame = cap.read()
+                if not ret:
+                    break
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 frames.append(Image.fromarray(frame_rgb))
-                target_ptr += 1
-            current_idx += 1
+        else:
+            current_idx = 0
+            target_ptr = 0
+            while target_ptr < len(target_indices):
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                if current_idx == target_indices[target_ptr]:
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    frames.append(Image.fromarray(frame_rgb))
+                    target_ptr += 1
+                current_idx += 1
         cap.release()
         if not frames:
             raise RuntimeError(f"未能读取任何帧: {full_path}")
         true_frames = len(frames)
         # repeat-last padding
-        while len(frames) < self.max_video_frames:
+        while len(frames) < self.video_clip_len:
             frames.append(frames[-1].copy())
-        video_tensor = torch.stack([self.video_transform(frame) for frame in frames[: self.max_video_frames]])
-        mask = torch.zeros(self.max_video_frames, dtype=torch.float32)
-        mask[: min(true_frames, self.max_video_frames)] = 1.0
+        target_size = self._select_dynamic_size(self.dynamic_video_sizes)
+        video_tensor = torch.stack(
+            [self._apply_video_transform(frame, target_size) for frame in frames[: self.video_clip_len]]
+        )
+        mask = torch.zeros(self.video_clip_len, dtype=torch.float32)
+        mask[: min(true_frames, self.video_clip_len)] = 1.0
         return video_tensor, mask
 
     def __getitem__(self, idx: int) -> Optional[Dict[str, Any]]:
@@ -267,6 +379,24 @@ def _pad_sequence(sequences: List[torch.Tensor], pad_value: int) -> torch.Tensor
     return torch.stack(padded, dim=0)
 
 
+def _pad_image_tensor(image: torch.Tensor, target_h: int, target_w: int) -> torch.Tensor:
+    _, h, w = image.shape
+    pad_h = target_h - h
+    pad_w = target_w - w
+    if pad_h <= 0 and pad_w <= 0:
+        return image
+    return F.pad(image, (0, pad_w, 0, pad_h))
+
+
+def _pad_video_tensor(video: torch.Tensor, target_h: int, target_w: int) -> torch.Tensor:
+    _, _, h, w = video.shape
+    pad_h = target_h - h
+    pad_w = target_w - w
+    if pad_h <= 0 and pad_w <= 0:
+        return video
+    return F.pad(video, (0, pad_w, 0, pad_h))
+
+
 def collate_multimodal_batch(
     batch: List[Optional[Dict[str, Any]]],
     allow_missing_modalities: bool = False,
@@ -302,14 +432,20 @@ def collate_multimodal_batch(
 
     # 图像
     if all("image" in s for s in filtered_samples):
-        images = torch.stack([s["image"] for s in filtered_samples])
+        image_tensors = [s["image"] for s in filtered_samples]
+        max_h = max(img.shape[1] for img in image_tensors)
+        max_w = max(img.shape[2] for img in image_tensors)
+        images = torch.stack([_pad_image_tensor(img, max_h, max_w) for img in image_tensors])
         inputs["image_input"] = images
         targets["image"] = images
         valid_flags["image"] = [s.get("valid", {}).get("image", False) for s in filtered_samples]
 
     # 视频
     if all("video" in s for s in filtered_samples):
-        videos = torch.stack([s["video"] for s in filtered_samples])
+        video_tensors = [s["video"] for s in filtered_samples]
+        max_h = max(vid.shape[2] for vid in video_tensors)
+        max_w = max(vid.shape[3] for vid in video_tensors)
+        videos = torch.stack([_pad_video_tensor(vid, max_h, max_w) for vid in video_tensors])
         inputs["video_input"] = videos
         targets["video"] = videos
         masks = [s.get("video_frame_mask", torch.ones(videos.shape[1])) for s in filtered_samples]
@@ -340,6 +476,10 @@ class MultimodalDataLoader:
         image_size: Tuple[int, int] = (224, 224),
         max_text_length: int = 512,
         max_video_frames: int = 10,
+        video_clip_len: Optional[int] = None,
+        video_stride: int = 1,
+        video_sampling_strategy: str = "contiguous_clip",
+        video_eval_sampling_strategy: str = "uniform",
         prefetch_factor: int = 2,
         allow_missing_modalities: bool = False,
         strict_mode: bool = True,
@@ -355,6 +495,10 @@ class MultimodalDataLoader:
         self.image_size = image_size
         self.max_text_length = max_text_length
         self.max_video_frames = max_video_frames
+        self.video_clip_len = video_clip_len
+        self.video_stride = video_stride
+        self.video_sampling_strategy = video_sampling_strategy
+        self.video_eval_sampling_strategy = video_eval_sampling_strategy
         self.prefetch_factor = prefetch_factor
         self.allow_missing_modalities = allow_missing_modalities
         self.strict_mode = strict_mode
@@ -382,6 +526,10 @@ class MultimodalDataLoader:
             video_transform=video_transform,
             max_text_length=self.max_text_length,
             max_video_frames=self.max_video_frames,
+            video_clip_len=self.video_clip_len,
+            video_stride=self.video_stride,
+            video_sampling_strategy=self.video_sampling_strategy,
+            video_eval_sampling_strategy=self.video_eval_sampling_strategy,
             image_size=self.image_size,
             is_train=is_train,
             allow_missing_modalities=self.allow_missing_modalities,
@@ -436,6 +584,8 @@ if __name__ == "__main__":
     parser.add_argument("--manifest", type=str, required=True, help="Manifest v2 路径")
     parser.add_argument("--data_dir", type=str, default=".", help="数据根目录")
     parser.add_argument("--max_video_frames", type=int, default=10)
+    parser.add_argument("--video_clip_len", type=int, default=None)
+    parser.add_argument("--video_sampling_strategy", type=str, default="uniform")
     parser.add_argument("--max_text_length", type=int, default=64)
     parser.add_argument("--image_size", type=int, nargs=2, default=(224, 224))
     parser.add_argument("--normalize", action="store_true", help="启用 ImageNet 归一化")
@@ -450,6 +600,8 @@ if __name__ == "__main__":
         data_list=manifest_data,
         max_text_length=args.max_text_length,
         max_video_frames=args.max_video_frames,
+        video_clip_len=args.video_clip_len,
+        video_sampling_strategy=args.video_sampling_strategy,
         image_size=tuple(args.image_size),
         is_train=False,
         allow_missing_modalities=True,

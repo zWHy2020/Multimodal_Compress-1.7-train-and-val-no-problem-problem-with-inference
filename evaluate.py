@@ -873,6 +873,10 @@ def main():
             'video_use_optical_flow': True,
             'video_use_convlstm': True,
             'video_output_dim': 256,
+            'video_decoder_type': "unet",
+            'video_unet_base_channels': 64,
+            'video_unet_num_down': 4,
+            'video_unet_num_res_blocks': 3,
             'channel_type': "awgn",
             'snr_db': 10.0
         }

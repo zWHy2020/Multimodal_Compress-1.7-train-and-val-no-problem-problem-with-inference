@@ -221,6 +221,20 @@ def _choose_video_id_col(headers: List[str], video_id_col: Optional[str]) -> str
 
 def _collect_keyframes(keyframes_dir: str, video_id: str) -> List[str]:
     candidates: List[str] = []
+    parts = video_id.split("_")
+    if len(parts) >= 5 and parts[0] == "scenario" and parts[2] == "behavior":
+        scenario = f"{parts[0]}_{parts[1]}"
+        behavior = f"{parts[2]}_{parts[3]}"
+        clip = "_".join(parts[4:])
+        nested_dir = os.path.join(keyframes_dir, scenario, behavior, clip)
+        for candidate_dir in (nested_dir, os.path.join(nested_dir, "frames"), os.path.join(nested_dir, "keyframes")):
+            if not os.path.isdir(candidate_dir):
+                continue
+            for fname in sorted(os.listdir(candidate_dir)):
+                if fname.lower().endswith((".jpg", ".jpeg", ".png")):
+                    candidates.append(os.path.join(candidate_dir, fname))
+            if candidates:
+                return candidates
     subdir = os.path.join(keyframes_dir, video_id)
     if os.path.isdir(subdir):
         for fname in sorted(os.listdir(subdir)):
@@ -251,6 +265,29 @@ def _dedupe_texts(texts: Iterable[str]) -> List[str]:
     return cleaned
 
 
+def _scan_chatscene_video_ids(video_dir: str) -> Tuple[Dict[str, str], Dict[str, List[str]]]:
+    if not os.path.isdir(video_dir):
+        return {}, {}
+    video_ids: Dict[str, str] = {}
+    group_map: Dict[str, List[str]] = {}
+    for root, dirs, files in os.walk(video_dir):
+        dirs.sort()
+        files.sort()
+        rel_dir = os.path.relpath(root, video_dir)
+        rel_dir = "" if rel_dir == "." else rel_dir
+        group_id = rel_dir.replace(os.sep, "_") if rel_dir else ""
+        for fname in files:
+            lower = fname.lower()
+            if lower.endswith(".mp4") or lower.endswith(".avi"):
+                stem = os.path.splitext(fname)[0]
+                video_id = f"{group_id}_{stem}" if group_id else stem
+                rel_path = os.path.join(rel_dir, fname) if rel_dir else fname
+                video_ids[video_id] = rel_path
+                group_key = group_id or stem
+                group_map.setdefault(group_key, []).append(video_id)
+    return video_ids, group_map
+
+
 def build_chatscene_manifests(
     data_dir: str,
     video_dir: str,
@@ -271,17 +308,32 @@ def build_chatscene_manifests(
     val_ids = _read_split_file(os.path.join(splits_dir, "val.txt"))
     test_ids = _read_split_file(os.path.join(splits_dir, "test.txt"))
 
+    video_id_map, group_map = _scan_chatscene_video_ids(video_dir)
     with open(csv_path, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         headers = reader.fieldnames or []
         video_col = _choose_video_id_col(headers, video_id_col)
         text_column = _choose_text_col(headers, text_col)
         text_by_video: Dict[str, List[str]] = collections.defaultdict(list)
+        unmatched_ids = set()
         for row in reader:
             vid = str(row.get(video_col, "")).strip()
             if not vid:
                 continue
-            text_by_video[vid].append(row.get(text_column, ""))
+            text = row.get(text_column, "")
+            if vid in video_id_map:
+                text_by_video[vid].append(text)
+            elif vid in group_map:
+                for child_id in group_map[vid]:
+                    text_by_video[child_id].append(text)
+            else:
+                unmatched_ids.add(vid)
+    if unmatched_ids:
+        logger.warning(
+            "CSV 中有 %d 个 video_id 未匹配到视频或分组（示例: %s）",
+            len(unmatched_ids),
+            ", ".join(sorted(unmatched_ids)[:5]),
+        )
 
     rng = random.Random(seed)
     stats = {
@@ -298,7 +350,11 @@ def build_chatscene_manifests(
         for vid in video_ids:
             if max_samples and stats["total_samples"] >= max_samples:
                 break
-            video_path = os.path.join(video_dir, f"{vid}.mp4")
+            video_rel_path = video_id_map.get(vid)
+            if video_rel_path:
+                video_path = os.path.join(video_dir, video_rel_path)
+            else:
+                video_path = os.path.join(video_dir, f"{vid}.mp4")
             if not os.path.exists(video_path):
                 stats["missing_video"] += 1
                 if strict:
