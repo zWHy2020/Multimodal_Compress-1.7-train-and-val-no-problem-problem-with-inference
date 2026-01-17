@@ -98,6 +98,7 @@ class MultimodalJSCC(nn.Module):
         # 视频编码器参数
         video_hidden_dim: int = 256,
         video_num_frames: int = 5,
+        video_clip_len: int | None = None,
         video_use_optical_flow: bool = True,
         video_use_convlstm: bool = True,
         video_output_dim: int = 256,
@@ -124,6 +125,9 @@ class MultimodalJSCC(nn.Module):
         # 训练参数
     ):
         super().__init__()
+
+        if video_clip_len is not None:
+            video_num_frames = video_clip_len
         
         # 【Phase 1】保存预训练参数
         self.pretrained = pretrained
