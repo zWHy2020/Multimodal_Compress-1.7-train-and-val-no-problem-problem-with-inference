@@ -1306,9 +1306,15 @@ def main():
                 file_ext = input_ext if input_ext != '.jpeg' else '.jpg'
             else:
                 file_ext = '.png'
-            args.output = os.path.join(args.output, f'{base_name}_reconstructed{file_ext}')
+            desired_name = f'{base_name}_reconstructed{file_ext}'
         else:
-            args.output = os.path.join(args.output, f'{base_name}_reconstructed.txt')
+            desired_name = f'{base_name}_reconstructed.txt'
+
+        output_basename = os.path.basename(args.output)
+        if output_basename == desired_name:
+            args.output = os.path.join(os.path.dirname(args.output), desired_name)
+        else:
+            args.output = os.path.join(args.output, desired_name)
     
     # 创建输出目录
     if modality == 'video':
