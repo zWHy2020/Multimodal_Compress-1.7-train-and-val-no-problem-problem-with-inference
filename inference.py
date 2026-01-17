@@ -10,6 +10,7 @@ import sys
 import torch
 import argparse
 import logging
+import inspect
 from pathlib import Path
 from typing import Optional, Dict, Any, List,Tuple
 from PIL import Image
@@ -970,8 +971,19 @@ def load_model(model_path: str, config: EvaluationConfig, device: torch.device, 
     model_config["snr_db"] = config.snr_db
     model_config["use_text_guidance_image"] = getattr(config, "use_text_guidance_image", False)
     model_config["use_text_guidance_video"] = getattr(config, "use_text_guidance_video", False)
+    model_kwargs = dict(model_config)
     try:
-         model = MultimodalJSCC(**model_config)
+        model_param_names = set(inspect.signature(MultimodalJSCC.__init__).parameters.keys())
+        model_param_names.discard("self")
+        extra_keys = [key for key in model_kwargs if key not in model_param_names]
+        if extra_keys:
+            logger.warning(
+                "⚠️ Checkpoint 配置中包含未在当前模型构造函数中出现的参数: %s; 将自动忽略。",
+                ", ".join(sorted(extra_keys)),
+            )
+            for key in extra_keys:
+                model_kwargs.pop(key, None)
+        model = MultimodalJSCC(**model_kwargs)
     except TypeError as e:
         logger.error(f"模型初始化失败，参数不匹配: {e}")
         logger.error("这通常是因为训练时的代码版本与当前代码版本的参数列表不一致。")
