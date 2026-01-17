@@ -596,24 +596,23 @@ class SwinTransformerBlock(nn.Module):
         B, L, C = x.shape
         assert L == H * W, "输入特征长度与分辨率不匹配"
 
-        if H < self.window_size or W < self.window_size:
-            raise RuntimeError(
-                f"输入分辨率 {H}x{W} 小于窗口大小 {self.window_size}，"
-                "无法进行窗口注意力。"
-            )
+        window_size = min(self.window_size, H, W)
+        shift_size = self.shift_size if min(H, W) > window_size else 0
+        if shift_size >= window_size:
+            shift_size = 0
+
         shortcut = x
         x = self.norm1(x)
         x = x.view(B, H, W, C)
-        pad_b = (self.window_size - H % self.window_size) % self.window_size
-        pad_r = (self.window_size - W % self.window_size) % self.window_size
+        pad_b = (window_size - H % window_size) % window_size
+        pad_r = (window_size - W % window_size) % window_size
         if pad_b or pad_r:
             x = x.permute(0, 3, 1, 2)
             x = F.pad(x, (0, pad_r, 0, pad_b))
             x = x.permute(0, 2, 3, 1)
         H_pad, W_pad = H + pad_b, W + pad_r
-        shift_size = self.shift_size if min(H_pad, W_pad) > self.window_size else 0
         attn_mask = self._build_attn_mask(
-            H_pad, W_pad, self.window_size, shift_size, x.device, x.dtype
+            H_pad, W_pad, window_size, shift_size, x.device, x.dtype
         )
         
         # 循环移位
@@ -623,8 +622,8 @@ class SwinTransformerBlock(nn.Module):
             shifted_x = x
         
         # 窗口分割（内存优化：及时释放中间变量）
-        x_windows = window_partition(shifted_x, self.window_size)
-        x_windows = x_windows.view(-1, self.window_size * self.window_size, C)
+        x_windows = window_partition(shifted_x, window_size)
+        x_windows = x_windows.view(-1, window_size * window_size, C)
         del shifted_x  # 及时释放，减少内存占用
         
         # 窗口注意力（使用梯度检查点以降低显存峰值）
@@ -638,10 +637,10 @@ class SwinTransformerBlock(nn.Module):
             attn_windows = self.attn(x_windows, mask=attn_mask)
         del x_windows  # 及时释放
         
-        attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
+        attn_windows = attn_windows.view(-1, window_size, window_size, C)
         
         # 窗口重组
-        shifted_x = window_reverse(attn_windows, self.window_size, H_pad, W_pad)
+        shifted_x = window_reverse(attn_windows, window_size, H_pad, W_pad)
         del attn_windows  # 及时释放
         
         # 反向循环移位
