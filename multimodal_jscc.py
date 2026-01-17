@@ -524,6 +524,8 @@ class MultimodalJSCC(nn.Module):
         text_attention_mask: Optional[torch.Tensor] = None,
         semantic_context: Optional[torch.Tensor] = None,
         multiple_semantic_contexts: Optional[List[torch.Tensor]] = None,
+        image_input_resolution: Optional[Tuple[int, int]] = None,
+        image_output_resolution: Optional[Tuple[int, int]] = None,
         snr_db: float = 10.0
     ) -> Dict[str, torch.Tensor]:
         """
@@ -558,6 +560,8 @@ class MultimodalJSCC(nn.Module):
                 guide_vectors['image'],
                 semantic_context=semantic_for_image,
                 multiple_semantic_contexts=multiple_semantic_contexts,  # 传递语义上下文
+                input_resolution=image_input_resolution,
+                output_resolution=image_output_resolution,
                 snr_db=snr_db
             )
             results['image_decoded'] = image_decoded
