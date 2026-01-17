@@ -428,7 +428,12 @@ class WindowAttention(nn.Module):
         
         nn.init.trunc_normal_(self.relative_position_bias_table, std=.02)
     
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        window_size: Optional[Tuple[int, int]] = None,
+    ) -> torch.Tensor:
         """
         前向传播（内存优化版本）
         
@@ -440,6 +445,7 @@ class WindowAttention(nn.Module):
             torch.Tensor: 注意力输出
         """
         B_, N, C = x.shape
+        target_window = to_2tuple(window_size) if window_size is not None else self.window_size
         # 优化QKV计算，使用更节省内存的方式
         qkv = self.qkv(x)
         # 立即reshape和permute，避免大的中间张量
@@ -456,9 +462,41 @@ class WindowAttention(nn.Module):
         attn = torch.matmul(q, k.transpose(-2, -1))
         
         # 添加相对位置偏置
-        relative_position_bias = self.relative_position_bias_table[
-            self.relative_position_index.view(-1)
-        ].view(N, N, -1)
+        if target_window == self.window_size:
+            relative_position_bias = self.relative_position_bias_table[
+                self.relative_position_index.view(-1)
+            ].view(N, N, -1)
+        else:
+            original_window = self.window_size
+            relative_position_bias_table = self.relative_position_bias_table.view(
+                2 * original_window[0] - 1,
+                2 * original_window[1] - 1,
+                -1,
+            ).permute(2, 0, 1).unsqueeze(0)
+            relative_position_bias_table = F.interpolate(
+                relative_position_bias_table,
+                size=(2 * target_window[0] - 1, 2 * target_window[1] - 1),
+                mode="bicubic",
+                align_corners=False,
+            )
+            relative_position_bias_table = (
+                relative_position_bias_table.squeeze(0)
+                .permute(1, 2, 0)
+                .reshape(-1, self.num_heads)
+            )
+            coords_h = torch.arange(target_window[0], device=x.device)
+            coords_w = torch.arange(target_window[1], device=x.device)
+            coords = torch.stack(torch.meshgrid(coords_h, coords_w, indexing='ij'))
+            coords_flatten = torch.flatten(coords, 1)
+            relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]
+            relative_coords = relative_coords.permute(1, 2, 0).contiguous()
+            relative_coords[:, :, 0] += target_window[0] - 1
+            relative_coords[:, :, 1] += target_window[1] - 1
+            relative_coords[:, :, 0] *= 2 * target_window[1] - 1
+            relative_position_index = relative_coords.sum(-1)
+            relative_position_bias = relative_position_bias_table[
+                relative_position_index.view(-1)
+            ].view(N, N, -1)
         relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()
         attn = attn + relative_position_bias.unsqueeze(0)
         del relative_position_bias  # 及时释放
@@ -631,10 +669,10 @@ class SwinTransformerBlock(nn.Module):
             # 使用梯度检查点：在反向传播时重新计算，以节省显存
             # 创建包装函数以支持关键字参数
             def attn_with_mask(x):
-                return self.attn(x, mask=attn_mask)
+                return self.attn(x, mask=attn_mask, window_size=(window_size, window_size))
             attn_windows = checkpoint(attn_with_mask, x_windows, use_reentrant=False)
         else:
-            attn_windows = self.attn(x_windows, mask=attn_mask)
+            attn_windows = self.attn(x_windows, mask=attn_mask, window_size=(window_size, window_size))
         del x_windows  # 及时释放
         
         attn_windows = attn_windows.view(-1, window_size, window_size, C)
