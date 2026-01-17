@@ -1297,6 +1297,24 @@ def main():
             elif modality == 'text':
                 args.output = args.output + '.txt'
             # video模式不需要扩展名，因为它输出的是目录
+
+    if modality in ['image', 'text'] and os.path.isdir(args.output):
+        base_name = os.path.splitext(os.path.basename(args.input))[0]
+        if modality == 'image':
+            input_ext = os.path.splitext(args.input)[1].lower()
+            if input_ext in ['.jpg', '.jpeg', '.png', '.bmp']:
+                file_ext = input_ext if input_ext != '.jpeg' else '.jpg'
+            else:
+                file_ext = '.png'
+            desired_name = f'{base_name}_reconstructed{file_ext}'
+        else:
+            desired_name = f'{base_name}_reconstructed.txt'
+
+        output_basename = os.path.basename(args.output)
+        if output_basename == desired_name:
+            args.output = os.path.join(os.path.dirname(args.output), desired_name)
+        else:
+            args.output = os.path.join(args.output, desired_name)
     
     # 创建输出目录
     if modality == 'video':
