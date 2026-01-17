@@ -381,6 +381,60 @@ def merge_video_clip_patches(
             frame = frame.squeeze(0)
         reconstructed_frames.append(frame)
     return torch.stack(reconstructed_frames, dim=0)
+
+
+def resolve_patch_decode_resolution(
+    model: MultimodalJSCC,
+    patch_size_hw: Tuple[int, int],
+    logger: logging.Logger,
+) -> Tuple[Optional[Tuple[int, int]], Optional[Tuple[int, int]]]:
+    patch_embed = getattr(model.image_encoder, "patch_embed", None)
+    patch_embed_size = getattr(patch_embed, "patch_size", None)
+    if patch_embed_size is None:
+        patch_embed_size = getattr(model.image_encoder, "patch_size", None)
+    if patch_embed_size is None:
+        logger.warning("未能从模型中解析 patch_embed 大小，将跳过 patch 分辨率传参。")
+        return None, None
+
+    if isinstance(patch_embed_size, (list, tuple)):
+        patch_embed_h, patch_embed_w = patch_embed_size
+    else:
+        patch_embed_h = patch_embed_w = patch_embed_size
+
+    if patch_embed_h <= 0 or patch_embed_w <= 0:
+        logger.warning("patch_embed 大小非法，将跳过 patch 分辨率传参。")
+        return None, None
+
+    patch_h, patch_w = patch_size_hw
+    if patch_h % patch_embed_h != 0 or patch_w % patch_embed_w != 0:
+        logger.warning(
+            "patch 尺寸无法被 patch_embed 大小整除，将跳过 patch 分辨率传参。"
+        )
+        return None, None
+
+    patch_grid = (patch_h // patch_embed_h, patch_w // patch_embed_w)
+    num_layers = getattr(model.image_decoder, "num_layers", None)
+    if num_layers is None:
+        logger.warning("未能读取解码器层数，将跳过 patch 分辨率传参。")
+        return None, None
+
+    scale = 2 ** (num_layers - 1)
+    if scale <= 0:
+        logger.warning("解码器层数非法，将跳过 patch 分辨率传参。")
+        return None, None
+
+    if patch_grid[0] % scale != 0 or patch_grid[1] % scale != 0:
+        logger.warning(
+            "patch 网格尺寸无法整除解码器缩放比例，将跳过 patch 分辨率传参。"
+        )
+        return None, None
+
+    input_resolution = (patch_grid[0] // scale, patch_grid[1] // scale)
+    if input_resolution[0] <= 0 or input_resolution[1] <= 0:
+        logger.warning("推理得到的输入分辨率非法，将跳过 patch 分辨率传参。")
+        return None, None
+
+    return input_resolution, patch_grid
  
     #image_tensor = torch.clamp(image_tensor, 0, 1)
     
@@ -494,6 +548,11 @@ def infer_image(
             patches, meta = split_image_v2(padded_image, patch_size, config.patch_overlap)
             logger.info(f"使用 patch-based 推理（patch_size={patch_size}, overlap={config.patch_overlap}）")
             patches = patches.to(device)
+            patch_decode_input_res, patch_decode_output_res = resolve_patch_decode_resolution(
+                model,
+                (patches.shape[-2], patches.shape[-1]),
+                logger,
+            )
             if max(original_shape) > patch_size:
                 global_input = transforms.functional.resize(image, (patch_size, patch_size))
             else:
@@ -552,6 +611,8 @@ def infer_image(
                     guide_vectors=guide_dict,
                     semantic_context=semantic_context,
                     multiple_semantic_contexts=multiple_semantic_contexts,
+                    image_input_resolution=patch_decode_input_res,
+                    image_output_resolution=patch_decode_output_res,
                     snr_db=config.snr_db
                 )
                 patch_decoded_image = decoded_results['image_decoded']

@@ -34,6 +34,60 @@ from utils import (
 )
 
 
+def resolve_patch_decode_resolution(
+    model: MultimodalJSCC,
+    patch_size_hw: Tuple[int, int],
+    logger: logging.Logger,
+) -> Tuple[Optional[Tuple[int, int]], Optional[Tuple[int, int]]]:
+    patch_embed = getattr(model.image_encoder, "patch_embed", None)
+    patch_embed_size = getattr(patch_embed, "patch_size", None)
+    if patch_embed_size is None:
+        patch_embed_size = getattr(model.image_encoder, "patch_size", None)
+    if patch_embed_size is None:
+        logger.warning("未能从模型中解析 patch_embed 大小，将跳过 patch 分辨率传参。")
+        return None, None
+
+    if isinstance(patch_embed_size, (list, tuple)):
+        patch_embed_h, patch_embed_w = patch_embed_size
+    else:
+        patch_embed_h = patch_embed_w = patch_embed_size
+
+    if patch_embed_h <= 0 or patch_embed_w <= 0:
+        logger.warning("patch_embed 大小非法，将跳过 patch 分辨率传参。")
+        return None, None
+
+    patch_h, patch_w = patch_size_hw
+    if patch_h % patch_embed_h != 0 or patch_w % patch_embed_w != 0:
+        logger.warning(
+            "patch 尺寸无法被 patch_embed 大小整除，将跳过 patch 分辨率传参。"
+        )
+        return None, None
+
+    patch_grid = (patch_h // patch_embed_h, patch_w // patch_embed_w)
+    num_layers = getattr(model.image_decoder, "num_layers", None)
+    if num_layers is None:
+        logger.warning("未能读取解码器层数，将跳过 patch 分辨率传参。")
+        return None, None
+
+    scale = 2 ** (num_layers - 1)
+    if scale <= 0:
+        logger.warning("解码器层数非法，将跳过 patch 分辨率传参。")
+        return None, None
+
+    if patch_grid[0] % scale != 0 or patch_grid[1] % scale != 0:
+        logger.warning(
+            "patch 网格尺寸无法整除解码器缩放比例，将跳过 patch 分辨率传参。"
+        )
+        return None, None
+
+    input_resolution = (patch_grid[0] // scale, patch_grid[1] // scale)
+    if input_resolution[0] <= 0 or input_resolution[1] <= 0:
+        logger.warning("推理得到的输入分辨率非法，将跳过 patch 分辨率传参。")
+        return None, None
+
+    return input_resolution, patch_grid
+
+
 class EvaluationDataset(Dataset):
     """
     专门用于评估的数据集类
@@ -485,6 +539,11 @@ def evaluate_single_snr(
                     all_patches_tensor = torch.cat(all_patches, dim=0).to(device)  # [Total_Patches, C, patch_size, patch_size]
                     
                     logger.debug(f"视频分割为 {len(all_patches_tensor)} 个 patches（来自 {T} 帧）")
+                    patch_decode_input_res, patch_decode_output_res = resolve_patch_decode_resolution(
+                        model,
+                        (all_patches_tensor.shape[-2], all_patches_tensor.shape[-1]),
+                        logger,
+                    )
                     
                     # 【修复】使用分阶段处理：编码 -> 信道 -> 解码（传入语义上下文）
                     # 对所有patches进行推理（批量处理以提高效率）
@@ -510,7 +569,9 @@ def evaluate_single_snr(
                         patch_decoded = model.decode(
                             transmitted_features={'image': patch_transmitted},
                             guide_vectors={'image': patch_guide_vectors},
-                            semantic_context=semantic_context  # 【关键修复】传入语义上下文
+                            semantic_context=semantic_context,  # 【关键修复】传入语义上下文
+                            image_input_resolution=patch_decode_input_res,
+                            image_output_resolution=patch_decode_output_res,
                         )
                         # 立即移动到CPU以释放GPU内存
                         patch_results_list.append(patch_decoded['image_decoded'].cpu())
@@ -587,6 +648,11 @@ def evaluate_single_snr(
                     patch_size = expected_h
                     patches, meta = split_image_v2(img, patch_size, config.patch_overlap)
                     patches = patches.to(device)
+                    patch_decode_input_res, patch_decode_output_res = resolve_patch_decode_resolution(
+                        model,
+                        (patches.shape[-2], patches.shape[-1]),
+                        logger,
+                    )
                     
                     logger.debug(f"图像分割为 {len(patches)} 个 patches")
                     
@@ -614,7 +680,9 @@ def evaluate_single_snr(
                         patch_decoded = model.decode(
                             transmitted_features={'image': patch_transmitted},
                             guide_vectors={'image': patch_guide_vectors},
-                            semantic_context=semantic_context  # 【关键修复】传入语义上下文
+                            semantic_context=semantic_context,  # 【关键修复】传入语义上下文
+                            image_input_resolution=patch_decode_input_res,
+                            image_output_resolution=patch_decode_output_res,
                         )
                         # 立即移动到CPU以释放GPU内存
                         patch_results_list.append(patch_decoded['image_decoded'].cpu())
